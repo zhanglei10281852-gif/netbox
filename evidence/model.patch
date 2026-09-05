@@ -1,0 +1,1965 @@
+diff --git a/.trae/documents/webhook_multi_secret_plan.md b/.trae/documents/webhook_multi_secret_plan.md
+new file mode 100644
+index 000000000..bf82e30a5
+--- /dev/null
++++ b/.trae/documents/webhook_multi_secret_plan.md
+@@ -0,0 +1,127 @@
++# Webhook 多签名密钥（密钥轮换）实施计划
++
++## 需求要点（来自用户）
++
++1. 一个 Webhook 可维护多个带**稳定标识（key_id）**的签名密钥，且明确**一个主密钥**。
++2. 轮换重叠期：每次发送对**最终请求体**用每个启用的密钥分别生成 HMAC 签名，接收方可按 key_id 区分并接受新旧密钥；同时继续发送由主密钥生成的现有 `X-Hook-Signature` 头以兼容旧接收端。
++3. 密钥退役后，**新入队**事件不得携带其签名。
++4. **入队时固定**本次发送所用密钥集合（快照随 RQ 任务参数持久化）：排队期间配置变化、任务自动重试都不得改变该事件的签名身份。
++5. 创建/启用/切换主密钥/退役等操作必须：拒绝空标识、重复标识、无主密钥等不完整状态；**不留下部分更新**（事务性）。
++6. 升级兼容：已有单 `secret` 的 Webhook 迁移后签名结果与原来完全一致；未配置 secret 的 Webhook 仍不签名。
++
++## 仓库调研结论
++
++- Webhook 模型：[models.py](file:///f:/swe/090501/project-01/netbox/extras/models/models.py#L209-L407)（`extras` 应用），含 `secret` CharField(blank=True, max_length=255)。
++- 发送逻辑：[webhooks.py](file:///f:/swe/090501/project-01/netbox/extras/webhooks.py#L35-L115)。`generate_signature(body, secret)` = HMAC-SHA512 hex；发送时在 `requests` 准备请求后对 `prepared_request.body` 签名，设置 `X-Hook-Signature`；`webhook.secret == ''` 时不签名。
++- 入队：[event_rules.py](file:///f:/swe/090501/project-01/netbox/extras/event_rules.py#L33-L54) `WebhookAction.enqueue()` 构造 params 后 `rq_queue.enqueue('extras.webhooks.send_webhook', **params)`；参数随任务 pickle 持久化，RQ 重试复用同一组参数（`get_rq_retry()`）。事件在请求事务提交后由 `process_event_rules()` 处理。
++- 编辑视图为通用 `ObjectEditView`（[object_views.py](file:///f:/swe/090501/project-01/netbox/netbox/views/generic/object_views.py#L296-L309)），其 POST 已将 `form.save()` 包在 `transaction.atomic()` 中；表单校验在 `form.is_valid()` 完成。
++- Webhook 相关面：API 序列化器 [serializers_/events.py](file:///f:/swe/090501/project-01/netbox/extras/api/serializers_/events.py#L60-L69)（含 `secret` 字段，GET 可读）；表单 [model_forms.py](file:///f:/swe/090501/project-01/netbox/extras/forms/model_forms.py#L571-L593)、bulk_edit、bulk_import、filtersets、tables、panels（`WebhookHTTPPanel.secret = TextAttr`）、GraphQL `WebhookType`（strawberry auto）。
++- 迁移：extras 最新为 `0144_customfield_status.py`；仓库有手写 RunPython 数据迁移先例（如 `0108_convert_reports_to_scripts.py`）。
++- 测试：发送/入队测试在 [test_event_rules.py](file:///f:/swe/090501/project-01/netbox/extras/tests/test_event_rules.py)（setUp 直接用 `Webhook(secret=...)` 建对象；`test_send_webhook` 断言 `X-Hook-Signature`）；test_signals.py、test_api.py、test_views.py 有相关引用。
++- 环境限制：本机 Python 3.11 / Django 5.1，NetBox 4.6 要求 Python 3.12 / Django 6.1，**无法在此环境运行 Django 测试或 makemigrations**；迁移文件按 Django autodetector 输出格式手工编写（与 NetBox 仓库手写数据迁移的惯例一致），最终用 `py_compile`/ruff 做静态校验，并在交付说明中要求用户运行 `makemigrations --check` 与测试套件复核。
++
++## 设计方案
++
++### 数据模型（`extras/models/models.py`）
++
++新增 `WebhookSecret(models.Model)`（非 ChangeLoggedModel，避免密钥进入变更日志）：
++
++- `webhook`：FK→Webhook，`on_delete=CASCADE`，`related_name='secrets'`
++- `key_id`：CharField(max_length=100)，稳定标识，仅允许 `[A-Za-z0-9_-]+`（保证可安全出现在签名头中）
++- `secret`：CharField(max_length=255)，HMAC 密钥
++- `status`：CharField(choices=`WebhookSecretStatusChoices`, default=enabled)
++- `is_primary`：BooleanField(default=False)
++- Meta：`ordering = ('key_id',)`；约束：`UniqueConstraint(fields=['webhook','key_id'], ...)` 与部分唯一约束 `UniqueConstraint(fields=['webhook'], condition=Q(is_primary=True), ...)`（DB 层保证每个 webhook 至多一个主密钥）
++
++新增 `WebhookSecretStatusChoices`（`extras/choices.py`）：
++
++- `enabled`（启用：对新事件签名；绿色）
++- `disabled`（停用：暂存/暂停，不签名，可重新启用；灰色）
++- `retired`（退役：终态，不签名，不可改回/编辑，只能删除；红色）
++
++Webhook 模型：**移除 `secret` 字段**；新增方法：
++
++- `get_signing_keys_snapshot()`：返回启用中密钥的快照 `[{'key_id', 'secret', 'is_primary'}, ...]`（按 key_id 排序），入队与旧任务回退使用。
++- `sync_secrets(keys)`：在调用方事务内对账（先 `secrets.update(is_primary=False)` 避免部分唯一约束瞬态冲突，再 `update_or_create`，最后删除未出现的行）。
++
++模块级校验函数 `validate_signing_secrets(webhook, keys)`（表单与 API 共用），规则：
++
++1. 空列表 → 合法（不签名）。
++2. key_id 非空、字符集合法、≤100；secret 非空、≤255；status 合法。
++3. 集合内 key_id 不得重复。
++4. 有密钥时恰好一个 `is_primary=True`，且主密钥 status=enabled；退役行不得为主密钥（报错提示先切换主密钥）。
++5. 终态：库中已 retired 的行，提交值不得改其 status/secret（只能原样保留或整行删除）。
++6. 校验失败抛 `django.core.exceptions.ValidationError({'secrets': [...]})`；所有写操作在 `transaction.atomic()` 内执行 → 无部分更新。
++
++迁移（3 个，顺序执行）：
++
++- `0145_webhooksecret.py`：CreateModel（字段/约束与模型一致）。
++- `0146_webhook_secrets_populate.py`：RunPython：为每个 `secret != ''` 的 Webhook 创建 `WebhookSecret(key_id='default', secret=<旧secret>, status='enabled', is_primary=True)`；反向：把主密钥写回 `secret` 列（尽力而为）。
++- `0147_remove_webhook_secret.py`：RemoveField `webhook.secret`。
++
++### 入队快照（`extras/event_rules.py`）
++
++`WebhookAction.enqueue()` 的 params 增加 `'signing_keys': action_object.get_signing_keys_snapshot()`。快照在入队时（事件 flush、事务提交后）生成并随任务 pickle；退役/停用/新增密钥对已入队任务无影响；重试复用同一份 kwargs。
++
++### 发送签名（`extras/webhooks.py`）
++
++- `send_webhook(..., signing_keys=None)`：若 kwargs 无 `signing_keys`（升级前已入队的旧任务），回退为 `webhook.get_signing_keys_snapshot()`（等价旧代码“发送时实时读 secret”的行为）。
++- 请求 prepare 之后（签名对象为最终 `prepared_request.body`，与现状一致）：
++  - 对快照中每个密钥计算 `generate_signature(body, secret)`（算法不变，HMAC-SHA512 hex）。
++  - `X-Hook-Signature` = 主密钥签名（迁移后主密钥 secret 与旧 secret 相同 → 头值逐字节不变）。
++  - 新增 `X-Hook-Signatures`：逗号分隔的 `key_id=hexdigest` 列表（key_id 字符集受限，解析无歧义），包含全部启用密钥（含主密钥）。
++  - 快照为空 → 不设置任何签名头（与旧“无 secret 不签名”一致）。
++
++### REST API（`extras/api/serializers_/events.py`）
++
++- 新增 `WebhookSecretSerializer(serializers.Serializer)`：`key_id`、`secret`、`status`（ChoiceField，默认 enabled）、`is_primary`（默认 False）。
++- `WebhookSerializer`：移除 `secret`，新增 `secrets = WebhookSecretSerializer(many=True, required=False)`（GET 可读 secret，与旧字段行为一致）。
++- `create()`/`update()`：弹出 `secrets`，`transaction.atomic()` 内先存 webhook，再调用共用校验 + `sync_secrets()`；django ValidationError 转为 DRF ValidationError（400，按 secrets 字段返回）。PATCH 不带 `secrets` 时密钥保持不变。
++
++### UI（表单/面板/过滤器/表格）
++
++- 新增 `WebhookSecretsWidget`（自定义模板 `templates/extras/widgets/webhook_secrets.html`）+ `WebhookSecretsField`，置于 [model_forms.py](file:///f:/swe/090501/project-01/netbox/extras/forms/model_forms.py)：表格行渲染 主密钥单选 / key_id / secret / 状态（enabled/disabled/retired）/ 删除勾选；已有行在前、附 3 个空行（无需 JS）；退役行只读并带隐藏输入与删除框。`value_from_datadict` 收集并行数组为行 dict 列表（丢弃全空行、删除行）。
++- `WebhookForm`：字段集用 `secrets` 替换 `secret`；`__init__` 中给初值；`clean()` 调共用校验；`save()` 在通用视图的事务内对账子密钥。
++- `WebhookBulkEditForm`：移除 secret 字段。
++- `WebhookImportForm`：`secret` 改为声明式表单字段（保留旧 CSV 列兼容），`save()` 时若提供则创建 `key_id='default'` 的主密钥。
++- FilterSet/Table：移除 `secret`。
++- 面板：`WebhookHTTPPanel` 移除 secret；新增 `WebhookSecretsPanel`（自定义模板 `templates/extras/panels/webhook_secrets.html`，展示 key_id/状态徽章/主密钥/secret），挂到 Webhook 详情页布局。
++- GraphQL：`WebhookType` 的 exclude 增加 `'secrets'`（密钥不进 GraphQL）。
++
++### 文档（更新既有文件）
++
++- [docs/models/extras/webhook.md](file:///f:/swe/090501/project-01/docs/models/extras/webhook.md)：Secret 一节替换为“签名密钥”（多密钥、key_id、主密钥、状态、轮换流程、两个签名头）。
++- [docs/integrations/webhooks.md](file:///f:/swe/090501/project-01/docs/integrations/webhooks.md)：新增“请求签名/密钥轮换”章节，说明 `X-Hook-Signature`（主密钥，兼容）与 `X-Hook-Signatures`（`key_id=hex` 列表）格式及接收端验签建议。
++
++## 实施步骤（依赖顺序）
++
++1. `extras/choices.py`：新增 `WebhookSecretStatusChoices`。
++2. `extras/models/models.py`：新增 `WebhookSecret`、`validate_signing_secrets()`；Webhook 移除 `secret`、新增快照/对账方法；`__all__` 导出。
++3. 手写迁移 0145/0146/0147。
++4. `extras/event_rules.py`：入队快照；`extras/webhooks.py`：多密钥签名头 + 旧任务回退。
++5. API 序列化器：嵌套 secrets + 事务化 create/update。
++6. 表单（model_forms widget/field、bulk_edit、bulk_import）、filtersets、tables、panels + 两个模板、GraphQL exclude。
++7. 更新文档。
++8. 更新/新增测试（见下）。
++9. 静态校验：`python -m py_compile` 全部改动文件；`ruff check`；人工核对迁移字段与模型一致。
++
++## 测试计划
++
++更新既有引用（`secret=` 构造改为创建 WebhookSecret 行）：test_event_rules.py（setUp 3 个 webhook、`test_send_webhook` 断言）、test_signals.py、必要时 test_api/test_views 夹具。
++
++新增测试：
++
++- 模型/校验（test_models.py 或 test_event_rules.py）：重复 key_id、空 key_id、非法字符、空 secret、无主密钥、多个主密钥、主密钥非 enabled、退役主密钥被拒、retired 终态不可改；空密钥集合合法。
++- 快照：仅含 enabled；disabled/retired 不入快照；快照结构正确。
++- 发送：多密钥时 `X-Hook-Signatures` 含每个启用密钥且签名可独立验签；`X-Hook-Signature` 等于主密钥签名且等于 `generate_signature(body, 'default-secret')`（迁移等价性）；无密钥时无任何签名头。
++- 入队冻结：入队后退役旧密钥/新增新密钥，执行任务仍只携带快照内密钥（旧密钥签名仍在、新密钥缺席）；任务 kwargs 中 `signing_keys` 固定（重试身份不变）。
++- API：带嵌套 secrets 创建/更新成功；无主密钥/重复 id → 400 且库中无部分写入；轮换（加新密钥→切主→退役旧）全流程；GET 不再返回 `secret` 字段。
++- 表单：POST 含密钥行创建成功；非法提交返回表单错误且数据不变。
++
++## 风险与处理
++
++- **无法在本机运行测试/makemigrations**（Py3.11 vs 要求 3.12）：迁移按 autodetector 格式精写；交付后请用户运行 `python manage.py makemigrations --check`（应无变更）、`python manage.py migrate`、`python manage.py test extras` 复核。
++- **升级瞬间已排队的旧任务**：kwargs 无 `signing_keys` → 回退实时读取当前密钥（与旧行为一致），不会报错或丢签名。
++- **切换主密钥时部分唯一约束瞬态冲突**：对账前先清空 `is_primary`，事务提交时状态合法。
++- **密钥外泄面**：WebhookSecret 不做变更日志、不进 GraphQL；API/UI 可读性与旧 `secret` 字段保持一致（原本即明文可读）。
++- **CSV 批量导入旧文件**：保留 `secret` 列映射为 `default` 主密钥，避免旧导入流程断裂。
+diff --git a/docs/integrations/webhooks.md b/docs/integrations/webhooks.md
+index bcbd05350..436a4d10a 100644
+--- a/docs/integrations/webhooks.md
++++ b/docs/integrations/webhooks.md
+@@ -100,6 +100,30 @@ Using [Event Rules](../features/event-rules.md), when a change is detected, any
+ 
+ A request is considered successful if the response has a 2XX status code; otherwise, the request is marked as having failed. Failed requests may be requeued manually under System > Background Tasks.
+ 
++## Request Signing & Key Rotation
++
++When a webhook has at least one enabled signing secret, each request carries two headers, both computed as an HMAC (SHA-512) hex digest of the *final* request body using the secret as the key:
++
++* `X-Hook-Signature` — the signature produced by the webhook's **primary** secret. Receivers written for earlier NetBox releases verify this header exactly as before.
++* `X-Hook-Signatures` — a comma-separated list of `<key_id>=<signature>` entries, one entry per enabled secret, e.g.:
++
++```
++X-Hook-Signatures: primary=9f86d081...,rotated-2026=e3b0c442...
++```
++
++The receiver parses the entries, looks up the matching key by `key_id`, and compares the expected HMAC (e.g. with `hmac.compare_digest`) against the signature. Accepting any valid entry allows overlapping keys to coexist during rotation.
++
++Key IDs are stable identifiers containing only letters, numbers, hyphens, and underscores, and are managed on the webhook (in the UI editor or the REST API `secrets` field). Secrets may be **enabled** (sign new events), **disabled** (retained without signing; can be re-enabled), or **retired** (terminal; never signs new events and cannot be modified, only deleted). Exactly one enabled secret must be marked primary.
++
++To rotate the signing key without rejecting valid events:
++
++1. Add the new secret as *enabled* (not yet primary).
++2. Deploy the new key to the receiver and configure it to accept signatures from `X-Hook-Signatures` for either key ID.
++3. Mark the new secret *primary*. `X-Hook-Signature` then reflects the new key, while `X-Hook-Signatures` still carries both during the overlap.
++4. Once the receiver no longer needs the old key, **retire** (or delete) it.
++
++The set of keys used for an event is snapshotted when the event is enqueued and travels with the background job, so changing secrets while events are queued — or an automatic job retry — never changes which signatures a given event carries. Events enqueued after a key is retired or disabled simply do not include that key's signature. Webhooks without any secrets are sent without signature headers.
++
+ ## Troubleshooting
+ 
+ To assist with verifying that the content of outgoing webhooks is rendered correctly, NetBox provides a simple HTTP listener that can be run locally to receive and display webhook requests. First, modify the target URL of the desired webhook to `http://localhost:9000/`. This will instruct NetBox to send the request to the local server on TCP port 9000. Then, start the webhook receiver service from the NetBox root directory:
+diff --git a/docs/models/extras/webhook.md b/docs/models/extras/webhook.md
+index 2a0d2845b..abe6983d2 100644
+--- a/docs/models/extras/webhook.md
++++ b/docs/models/extras/webhook.md
+@@ -68,9 +68,23 @@ Any additional header to include with the outgoing HTTP request. These should be
+ 
+ Jinja2 template for a custom request body, if desired. If not defined, NetBox will populate the request body with a raw dump of the webhook context.
+ 
+-### Secret
++### Signing Secrets
+ 
+-A secret string used to prove authenticity of the request (optional). This will append a `X-Hook-Signature` header to the request, consisting of a HMAC (SHA-512) hex digest of the request body using the secret as the key.
++Webhooks may define one or more signing secrets used to prove the authenticity of each request. Each secret has:
++
++* A stable **key ID** containing only letters, numbers, hyphens, and underscores (e.g. `primary`, `2026-rotated`), which is sent with the request so the receiver can select the matching key.
++* The **secret value** itself, an HMAC key which is never transmitted in the request.
++* A **status**: *enabled* (signs outgoing requests), *disabled* (retained but not signing; can be re-enabled), or *retired* (permanently out of service; no longer signs new events and cannot be modified, only deleted).
++* A **primary** designation: exactly one enabled secret must be marked primary.
++
++When at least one enabled secret exists, requests carry two headers, both computed as a HMAC (SHA-512) hex digest of the final request body:
++
++* `X-Hook-Signature` — the signature of the **primary** secret. This header is unchanged from earlier NetBox releases, so existing receivers keep working.
++* `X-Hook-Signatures` — a comma-separated list of `key_id=signature` entries, one per **enabled** secret, allowing receivers to verify against any current key.
++
++To rotate a key without interrupting verification: add the new secret as *enabled* (non-primary), deploy it to the receiver, mark the new secret **primary** once receivers accept it, then **retire** the old secret. Retired and disabled secrets are omitted from events enqueued after the change. The set of keys used for an event is fixed when the event is enqueued, so in-flight events and retried jobs are always signed with exactly the keys that were active at enqueue time.
++
++Webhooks without any secrets continue to be sent without signature headers.
+ 
+ ### Conditions
+ 
+diff --git a/netbox/extras/api/serializers_/events.py b/netbox/extras/api/serializers_/events.py
+index 697eb50dd..46380486c 100644
+--- a/netbox/extras/api/serializers_/events.py
++++ b/netbox/extras/api/serializers_/events.py
+@@ -1,8 +1,10 @@
++from django.core.exceptions import ValidationError as DjangoValidationError
++from django.db import transaction
+ from rest_framework import serializers
+ 
+ from core.models import ObjectType
+ from extras.choices import *
+-from extras.models import EventRule, Webhook
++from extras.models import EventRule, Webhook, validate_signing_secrets
+ from netbox.api.fields import ChoiceField, ContentTypeField
+ from netbox.api.gfk_fields import GFKSerializerField
+ from netbox.api.serializers import NetBoxModelSerializer
+@@ -57,13 +59,93 @@ class EventRuleSerializer(OwnerMixin, NetBoxModelSerializer):
+ # Webhooks
+ #
+ 
++class WebhookSecretSerializer(serializers.Serializer):
++    """
++    A single signing secret belonging to a webhook. Managed inline via the webhook endpoint so
++    that the whole set of keys (including primary designation) is validated and saved atomically.
++    """
++    key_id = serializers.CharField(
++        max_length=100,
++        help_text="Stable identifier of this key, included in the X-Hook-Signatures request header."
++    )
++    secret = serializers.CharField(
++        max_length=255,
++        help_text="HMAC key used to sign the request body."
++    )
++    status = ChoiceField(
++        choices=WebhookSecretStatusChoices,
++        default=WebhookSecretStatusChoices.STATUS_ENABLED,
++        required=False,
++        help_text="Enabled keys sign events; disabled keys do not; retired keys are terminal and never sign new events."
++    )
++    is_primary = serializers.BooleanField(
++        default=False,
++        required=False,
++        help_text="When true, this key also signs the legacy X-Hook-Signature header. Exactly one enabled key "
++                  "must be primary."
++    )
++
++    def validate_key_id(self, value):
++        if not value:
++            raise serializers.ValidationError('Key ID is required.')
++        return value
++
++    def validate_secret(self, value):
++        if not value:
++            raise serializers.ValidationError('Secret value is required.')
++        return value
++
++
+ class WebhookSerializer(OwnerMixin, NetBoxModelSerializer):
++    secrets = WebhookSecretSerializer(
++        many=True,
++        required=False,
++        help_text="Signing secrets for this webhook. The set is replaced in full whenever provided. "
++                  "Exactly one enabled secret must be marked is_primary.",
++    )
+ 
+     class Meta:
+         model = Webhook
+         fields = [
+             'id', 'url', 'display_url', 'display', 'name', 'description', 'payload_url', 'http_method',
+-            'http_content_type', 'additional_headers', 'body_template', 'secret', 'ssl_verification', 'ca_file_path',
++            'http_content_type', 'additional_headers', 'body_template', 'secrets', 'ssl_verification', 'ca_file_path',
+             'timeout', 'custom_fields', 'owner', 'tags', 'created', 'last_updated',
+         ]
+         brief_fields = ('id', 'url', 'display', 'name', 'description')
++
++    def _sync_secrets(self, instance, secrets_data):
++        """
++        Validate and reconcile the supplied signing secrets onto the webhook. Raises a DRF
++        ValidationError (keyed under 'secrets') when the desired set is incomplete, leaving the
++        database untouched (the enclosing transaction is rolled back).
++        """
++        keys = [
++            {
++                'key_id': item['key_id'],
++                'secret': item['secret'],
++                'status': item.get('status', WebhookSecretStatusChoices.STATUS_ENABLED),
++                'is_primary': item.get('is_primary', False),
++            }
++            for item in secrets_data
++        ]
++        try:
++            validate_signing_secrets(instance, keys)
++        except DjangoValidationError as e:
++            raise serializers.ValidationError(e.message_dict if hasattr(e, 'message_dict') else e.messages)
++        instance.sync_secrets(keys)
++
++    def create(self, validated_data):
++        secrets_data = validated_data.pop('secrets', None)
++        with transaction.atomic():
++            instance = super().create(validated_data)
++            if secrets_data is not None:
++                self._sync_secrets(instance, secrets_data)
++        return instance
++
++    def update(self, instance, validated_data):
++        secrets_data = validated_data.pop('secrets', None)
++        with transaction.atomic():
++            instance = super().update(instance, validated_data)
++            if secrets_data is not None:
++                self._sync_secrets(instance, secrets_data)
++        return instance
+diff --git a/netbox/extras/choices.py b/netbox/extras/choices.py
+index 6be6756cf..ecd8e1709 100644
+--- a/netbox/extras/choices.py
++++ b/netbox/extras/choices.py
+@@ -262,6 +262,26 @@ class WebhookHttpMethodChoices(ChoiceSet):
+     )
+ 
+ 
++class WebhookSecretStatusChoices(ChoiceSet):
++    """
++    Status of a webhook signing secret.
++
++    enabled: The secret signs newly enqueued events.
++    disabled: The secret is retained but temporarily does not sign events; it can be enabled again.
++    retired: The secret is permanently out of service. It never signs new events and cannot be
++             modified (only deleted), so that receivers can finish their key rotation.
++    """
++    STATUS_ENABLED = 'enabled'
++    STATUS_DISABLED = 'disabled'
++    STATUS_RETIRED = 'retired'
++
++    CHOICES = (
++        Choice(STATUS_ENABLED, _('Enabled'), color='green'),
++        Choice(STATUS_DISABLED, _('Disabled'), color='gray'),
++        Choice(STATUS_RETIRED, _('Retired'), color='red'),
++    )
++
++
+ #
+ # Dashboard widgets
+ #
+diff --git a/netbox/extras/constants.py b/netbox/extras/constants.py
+index 91487742e..0df44baee 100644
+--- a/netbox/extras/constants.py
++++ b/netbox/extras/constants.py
+@@ -37,6 +37,11 @@ SCRIPT_MODULE_NAME_PREFIX = '_netbox_script_module_'
+ # Webhooks
+ HTTP_CONTENT_TYPE_JSON = 'application/json'
+ 
++# Stable key_id assigned to the single key migrated from the legacy Webhook.secret field (and
++# created when a secret is supplied via CSV import), so upgraded webhooks keep their original
++# primary signature.
++WEBHOOK_DEFAULT_KEY_ID = 'default'
++
+ WEBHOOK_EVENT_TYPES = {
+     # Map registered event types to public webhook "event" equivalents
+     OBJECT_CREATED: 'created',
+diff --git a/netbox/extras/event_rules.py b/netbox/extras/event_rules.py
+index 60c00c6b5..bc68c7abe 100644
+--- a/netbox/extras/event_rules.py
++++ b/netbox/extras/event_rules.py
+@@ -35,6 +35,12 @@ class WebhookAction(EventRuleAction):
+         queue_name = get_config().QUEUE_MAPPINGS.get('webhook', RQ_QUEUE_DEFAULT)
+         rq_queue = get_queue(queue_name)
+ 
++        # Snapshot the signing keys *now*, while the event is being enqueued, and persist them in
++        # the job parameters. This freezes the signature identity for this event: later changes to
++        # the webhook's signing secrets (retirement, rotation) and automatic job retries all send
++        # exactly the signatures determined at enqueue time.
++        signing_keys = action_object.get_signing_keys_snapshot()
++
+         # Compile the task parameters
+         params = {
+             'event_rule': event_rule,
+@@ -43,6 +49,7 @@ class WebhookAction(EventRuleAction):
+             'data': action_data,
+             'snapshots': event_context.get('snapshots'),
+             'timestamp': timezone.now().isoformat(),
++            'signing_keys': signing_keys,
+             'retry': get_rq_retry(),
+         }
+         if 'request' in event_context:
+diff --git a/netbox/extras/filtersets.py b/netbox/extras/filtersets.py
+index 09bed6be1..393d35b91 100644
+--- a/netbox/extras/filtersets.py
++++ b/netbox/extras/filtersets.py
+@@ -82,7 +82,7 @@ class WebhookFilterSet(OwnerFilterMixin, NetBoxModelFilterSet):
+     class Meta:
+         model = Webhook
+         fields = (
+-            'id', 'name', 'payload_url', 'http_method', 'http_content_type', 'secret', 'ssl_verification',
++            'id', 'name', 'payload_url', 'http_method', 'http_content_type', 'ssl_verification',
+             'ca_file_path', 'timeout', 'description',
+         )
+ 
+diff --git a/netbox/extras/forms/bulk_edit.py b/netbox/extras/forms/bulk_edit.py
+index a376e794a..6769726ad 100644
+--- a/netbox/extras/forms/bulk_edit.py
++++ b/netbox/extras/forms/bulk_edit.py
+@@ -271,10 +271,6 @@ class WebhookBulkEditForm(OwnerMixin, NetBoxModelBulkEditForm):
+         widget=BulkEditNullBooleanSelect(),
+         label=_('SSL verification')
+     )
+-    secret = forms.CharField(
+-        label=_('Secret'),
+-        required=False
+-    )
+     ca_file_path = forms.CharField(
+         required=False,
+         label=_('CA file path')
+@@ -286,7 +282,7 @@ class WebhookBulkEditForm(OwnerMixin, NetBoxModelBulkEditForm):
+         label=_('Timeout')
+     )
+ 
+-    nullable_fields = ('secret', 'ca_file_path', 'timeout')
++    nullable_fields = ('ca_file_path', 'timeout')
+ 
+ 
+ class EventRuleBulkEditForm(OwnerMixin, NetBoxModelBulkEditForm):
+diff --git a/netbox/extras/forms/bulk_import.py b/netbox/extras/forms/bulk_import.py
+index 81ea8e6d2..096372033 100644
+--- a/netbox/extras/forms/bulk_import.py
++++ b/netbox/extras/forms/bulk_import.py
+@@ -7,6 +7,7 @@ from django.utils.translation import gettext_lazy as _
+ 
+ from core.models import DataFile, DataSource, ObjectType
+ from extras.choices import *
++from extras.constants import WEBHOOK_DEFAULT_KEY_ID
+ from extras.models import *
+ from netbox.event_rules import get_event_rule_action
+ from netbox.events import get_event_type_choices
+@@ -250,14 +251,34 @@ class SavedFilterImportForm(OwnerCSVMixin, CSVModelForm):
+ 
+ 
+ class WebhookImportForm(OwnerCSVMixin, NetBoxModelImportForm):
++    # Legacy column: a single secret value is imported as the primary signing secret under the
++    # default key ID, so existing CSV imports behave as before multi-secret support.
++    secret = forms.CharField(
++        label=_('Secret'),
++        required=False,
++        help_text=_('Creates an enabled primary signing secret (key ID "default") for the webhook.')
++    )
+ 
+     class Meta:
+         model = Webhook
+         fields = (
+             'name', 'payload_url', 'http_method', 'http_content_type', 'additional_headers', 'body_template',
+-            'secret', 'ssl_verification', 'ca_file_path', 'timeout', 'description', 'owner', 'tags'
++            'ssl_verification', 'ca_file_path', 'timeout', 'description', 'owner', 'tags',
+         )
+ 
++    def save(self, commit=True):
++        instance = super().save(commit=commit)
++
++        if commit and self.cleaned_data.get('secret'):
++            instance.sync_secrets([{
++                'key_id': WEBHOOK_DEFAULT_KEY_ID,
++                'secret': self.cleaned_data['secret'],
++                'status': WebhookSecretStatusChoices.STATUS_ENABLED,
++                'is_primary': True,
++            }])
++
++        return instance
++
+ 
+ class EventRuleImportForm(OwnerCSVMixin, NetBoxModelImportForm):
+     object_types = CSVMultipleContentTypeField(
+diff --git a/netbox/extras/forms/model_forms.py b/netbox/extras/forms/model_forms.py
+index 8f02f88e1..f80a1588b 100644
+--- a/netbox/extras/forms/model_forms.py
++++ b/netbox/extras/forms/model_forms.py
+@@ -570,17 +570,118 @@ class SubscriptionForm(forms.ModelForm):
+         fields = ('object_type', 'object_id')
+ 
+ 
++class WebhookSecretsWidget(forms.Widget):
++    """
++    Renders the table of signing secrets on the webhook edit form. Each row submits a key_id, a
++    secret value, a status, and a shared primary-key radio; existing rows may be deleted via a
++    checkbox. Fully blank rows are ignored.
++    """
++    template_name = 'extras/widgets/webhook_secrets.html'
++
++    # Number of blank rows offered for new secrets.
++    extra = 3
++
++    def _serialize_row(self, index, data):
++        if isinstance(data, WebhookSecret):
++            row = {
++                'key_id': data.key_id,
++                'secret': data.secret,
++                'status': data.status,
++                'is_primary': data.is_primary,
++            }
++        else:
++            row = {
++                'key_id': data.get('key_id', ''),
++                'secret': data.get('secret', ''),
++                'status': data.get('status', WebhookSecretStatusChoices.STATUS_ENABLED),
++                'is_primary': bool(data.get('is_primary', False)),
++            }
++        status = row['status'] or WebhookSecretStatusChoices.STATUS_ENABLED
++        row.update({
++            'index': index,
++            'status': status,
++            'retired': status == WebhookSecretStatusChoices.STATUS_RETIRED,
++            'status_choices': WebhookSecretStatusChoices.CHOICES,
++        })
++        return row
++
++    def get_context(self, name, value, attrs):
++        context = super().get_context(name, value, attrs)
++        rows = [self._serialize_row(i, item) for i, item in enumerate(value or [])]
++        # Append blank rows for entering new secrets.
++        rows.extend([
++            self._serialize_row(len(rows) + i, {
++                'key_id': '',
++                'secret': '',
++                'status': WebhookSecretStatusChoices.STATUS_ENABLED,
++                'is_primary': False,
++            })
++            for i in range(self.extra)
++        ])
++        for row in rows:
++            row.update({'blank': not row['key_id'] and not row['secret']})
++        context['widget']['rows'] = rows
++        return context
++
++    def value_from_datadict(self, data, files, name):
++        key_ids = data.getlist(f'{name}_key_id')
++        secrets = data.getlist(f'{name}_secret')
++        statuses = data.getlist(f'{name}_status')
++        primary_index = data.get(f'{name}_primary')
++        deleted = set(data.getlist(f'{name}_delete'))
++
++        rows = []
++        for index, (key_id, secret, status) in enumerate(zip(key_ids, secrets, statuses)):
++            key_id = key_id.strip()
++            secret = secret.strip()
++            if not key_id and not secret:
++                # A fully blank template row; ignore it.
++                continue
++            if key_id in deleted:
++                # The row was marked for deletion.
++                continue
++            rows.append({
++                'key_id': key_id,
++                'secret': secret,
++                'status': status or WebhookSecretStatusChoices.STATUS_ENABLED,
++                'is_primary': primary_index is not None and str(index) == primary_index,
++            })
++        return rows
++
++
++class WebhookSecretsField(forms.Field):
++    """
++    Form field carrying the webhook's signing-secret set. Row-level validation (duplicate or
++    empty key IDs, primary designation, etc.) is performed against the full set in
++    WebhookForm.clean(); the field itself only normalizes the widget output.
++    """
++    widget = WebhookSecretsWidget
++    required = False
++
++    def clean(self, value):
++        return value or []
++
++
+ class WebhookForm(OwnerMixin, NetBoxModelForm):
+     http_method = ChoiceField(
+         label=_('HTTP method'),
+         choices=WebhookHttpMethodChoices,
+         initial=WebhookHttpMethodChoices.METHOD_POST,
+     )
++    secrets = WebhookSecretsField(
++        label=_('Signing secrets'),
++        help_text=_(
++            "One or more HMAC secrets used to sign outgoing requests. Exactly one enabled secret "
++            "must be marked primary; it also signs the legacy <code>X-Hook-Signature</code> header. "
++            "Add a new enabled secret to begin a key rotation, mark it primary once receivers accept "
++            "it, then retire the old secret."
++        ),
++    )
+ 
+     fieldsets = (
+         FieldSet('name', 'description', 'tags', name=_('Webhook')),
+         FieldSet(
+-            'payload_url', 'http_method', 'http_content_type', 'additional_headers', 'body_template', 'secret',
++            'payload_url', 'http_method', 'http_content_type', 'additional_headers', 'body_template', 'secrets',
+             'timeout', name=_('HTTP Request')
+         ),
+         FieldSet('ssl_verification', 'ca_file_path', name=_('SSL')),
+@@ -594,6 +695,33 @@ class WebhookForm(OwnerMixin, NetBoxModelForm):
+             'body_template': forms.Textarea(attrs={'class': 'font-monospace'}),
+         }
+ 
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++
++        # Populate the signing-secret editor with the persisted rows (the field has no model
++        # attribute of its own to bind to).
++        if self.instance.pk:
++            self.fields['secrets'].initial = list(self.instance.secrets.order_by('key_id'))
++
++    def clean(self):
++        super().clean()
++
++        if 'secrets' in self.cleaned_data:
++            try:
++                validate_signing_secrets(self.instance, self.cleaned_data['secrets'])
++            except forms.ValidationError as e:
++                self.add_error('secrets', e.message_dict.get('secrets', e.messages))
++
++    def save(self, commit=True):
++        instance = super().save(commit=commit)
++
++        # Reconcile signing secrets within the enclosing transaction (ObjectEditView saves the
++        # form inside transaction.atomic()), so an invalid set never leaves partial key rows.
++        if commit and 'secrets' in self.cleaned_data:
++            instance.sync_secrets(self.cleaned_data['secrets'])
++
++        return instance
++
+ 
+ class EventRuleForm(OwnerMixin, NetBoxModelForm):
+     action_type = ChoiceField(
+diff --git a/netbox/extras/graphql/filters.py b/netbox/extras/graphql/filters.py
+index 9b71a202e..70e1fd60e 100644
+--- a/netbox/extras/graphql/filters.py
++++ b/netbox/extras/graphql/filters.py
+@@ -396,7 +396,6 @@ class WebhookFilter(CustomFieldsFilterMixin, TagsFilterMixin, ChangeLoggedModelF
+     http_content_type: StrFilterLookup | None = strawberry_django.filter_field()
+     additional_headers: StrFilterLookup | None = strawberry_django.filter_field()
+     body_template: StrFilterLookup | None = strawberry_django.filter_field()
+-    secret: StrFilterLookup | None = strawberry_django.filter_field()
+     ssl_verification: FilterLookup[bool] | None = strawberry_django.filter_field()
+     ca_file_path: StrFilterLookup | None = strawberry_django.filter_field()
+     timeout: FilterLookup[int] | None = strawberry_django.filter_field()
+diff --git a/netbox/extras/graphql/types.py b/netbox/extras/graphql/types.py
+index 99deb43e4..5d78e0da3 100644
+--- a/netbox/extras/graphql/types.py
++++ b/netbox/extras/graphql/types.py
+@@ -233,7 +233,7 @@ class TagType(OwnerMixin, ObjectType):
+ 
+ @register_type(
+     models.Webhook,
+-    exclude=['content_types',],
++    exclude=['content_types', 'secrets'],
+     filters=WebhookFilter,
+     pagination=True
+ )
+diff --git a/netbox/extras/migrations/0145_webhooksecret.py b/netbox/extras/migrations/0145_webhooksecret.py
+new file mode 100644
+index 000000000..3fd3a8b66
+--- /dev/null
++++ b/netbox/extras/migrations/0145_webhooksecret.py
+@@ -0,0 +1,71 @@
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('extras', '0144_customfield_status'),
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='WebhookSecret',
++            fields=[
++                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('key_id', models.CharField(
++                    help_text='A stable identifier for this secret, included in the X-Hook-Signatures request '
++                              'header so receivers can select the matching key. May contain only letters, numbers, '
++                              'hyphens, and underscores.',
++                    max_length=100,
++                    verbose_name='key ID',
++                )),
++                ('secret', models.CharField(
++                    help_text='When provided, the request will include an HMAC hex digest of the payload body '
++                              'computed with this secret as the key. The secret itself is not transmitted in the '
++                              'request.',
++                    max_length=255,
++                    verbose_name='secret',
++                )),
++                ('status', models.CharField(
++                    choices=[('enabled', 'Enabled'), ('disabled', 'Disabled'), ('retired', 'Retired')],
++                    default='enabled',
++                    help_text='Enabled secrets sign outgoing requests. Disabled secrets are retained but do not '
++                              'sign. Retired secrets are permanently out of service and no longer sign new events.',
++                    max_length=20,
++                    verbose_name='status',
++                )),
++                ('is_primary', models.BooleanField(
++                    default=False,
++                    help_text='The primary secret signs the legacy X-Hook-Signature header. Exactly one enabled '
++                              'secret must be marked primary.',
++                    verbose_name='primary',
++                )),
++                ('webhook', models.ForeignKey(
++                    on_delete=models.deletion.CASCADE,
++                    related_name='secrets',
++                    to='extras.webhook',
++                    verbose_name='webhook',
++                )),
++            ],
++            options={
++                'ordering': ('key_id',),
++                'verbose_name': 'webhook signing secret',
++                'verbose_name_plural': 'webhook signing secrets',
++            },
++        ),
++        migrations.AddConstraint(
++            model_name='webhooksecret',
++            constraint=models.UniqueConstraint(
++                fields=('webhook', 'key_id'),
++                name='extras_webhooksecret_unique_webhook_key_id',
++            ),
++        ),
++        migrations.AddConstraint(
++            model_name='webhooksecret',
++            constraint=models.UniqueConstraint(
++                condition=models.Q(is_primary=True),
++                fields=('webhook',),
++                name='extras_webhooksecret_one_primary_per_webhook',
++            ),
++        ),
++    ]
+diff --git a/netbox/extras/migrations/0146_webhook_secrets_populate.py b/netbox/extras/migrations/0146_webhook_secrets_populate.py
+new file mode 100644
+index 000000000..e7eea5167
+--- /dev/null
++++ b/netbox/extras/migrations/0146_webhook_secrets_populate.py
+@@ -0,0 +1,53 @@
++from django.db import migrations
++
++# Stable key_id assigned to the single secret migrated from the legacy Webhook.secret field.
++DEFAULT_KEY_ID = 'default'
++STATUS_ENABLED = 'enabled'
++
++
++def populate_webhook_secrets(apps, schema_editor):
++    """
++    Migrate each webhook's legacy single `secret` value to a WebhookSecret row.
++
++    The migrated secret is enabled and marked primary, so the primary key's HMAC signature
++    (and therefore the legacy X-Hook-Signature header) is byte-for-byte identical to what the
++    webhook produced before the upgrade. Webhooks without a secret remain unsigned.
++    """
++    Webhook = apps.get_model('extras', 'Webhook')
++    WebhookSecret = apps.get_model('extras', 'WebhookSecret')
++
++    for webhook in Webhook.objects.exclude(secret=''):
++        WebhookSecret.objects.get_or_create(
++            webhook=webhook,
++            key_id=DEFAULT_KEY_ID,
++            defaults={
++                'secret': webhook.secret,
++                'status': STATUS_ENABLED,
++                'is_primary': True,
++            },
++        )
++
++
++def depopulate_webhook_secrets(apps, schema_editor):
++    """
++    Best-effort reverse: copy the migrated primary secret back onto the webhook. WebhookSecret
++    rows are removed by the reverse of the migration which created the table.
++    """
++    Webhook = apps.get_model('extras', 'Webhook')
++
++    for webhook in Webhook.objects.all():
++        secret = webhook.secrets.filter(key_id=DEFAULT_KEY_ID).first()
++        if secret is not None:
++            webhook.secret = secret.secret
++            webhook.save(update_fields=['secret'])
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('extras', '0145_webhooksecret'),
++    ]
++
++    operations = [
++        migrations.RunPython(code=populate_webhook_secrets, reverse_code=depopulate_webhook_secrets),
++    ]
+diff --git a/netbox/extras/migrations/0147_remove_webhook_secret.py b/netbox/extras/migrations/0147_remove_webhook_secret.py
+new file mode 100644
+index 000000000..3776fed7b
+--- /dev/null
++++ b/netbox/extras/migrations/0147_remove_webhook_secret.py
+@@ -0,0 +1,15 @@
++from django.db import migrations
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('extras', '0146_webhook_secrets_populate'),
++    ]
++
++    operations = [
++        migrations.RemoveField(
++            model_name='webhook',
++            name='secret',
++        ),
++    ]
+diff --git a/netbox/extras/models/models.py b/netbox/extras/models/models.py
+index 75b150dda..4ce6676d9 100644
+--- a/netbox/extras/models/models.py
++++ b/netbox/extras/models/models.py
+@@ -54,6 +54,8 @@ __all__ = (
+     'SavedFilter',
+     'TableConfig',
+     'Webhook',
++    'WebhookSecret',
++    'validate_signing_secrets',
+ )
+ 
+ # Matches a literal URL scheme (RFC 3986), independent of urlsplit()'s netloc parsing -- which can
+@@ -266,15 +268,6 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
+             "<code>timestamp</code>, <code>request</code>, and <code>data</code>."
+         )
+     )
+-    secret = models.CharField(
+-        verbose_name=_('secret'),
+-        max_length=255,
+-        blank=True,
+-        help_text=_(
+-            "When provided, the request will include a <code>X-Hook-Signature</code> header containing a HMAC hex "
+-            "digest of the payload body using the secret as the key. The secret is not transmitted in the request."
+-        )
+-    )
+     ssl_verification = models.BooleanField(
+         default=True,
+         verbose_name=_('SSL verification'),
+@@ -406,6 +399,227 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
+         """
+         return render_jinja2(self.payload_url, context)
+ 
++    def get_signing_keys_snapshot(self):
++        """
++        Return the set of signing keys to use for an event enqueued *now*, as a list of plain
++        dicts suitable for pickling into the background job's parameters:
++
++            [{'key_id': <str>, 'secret': <str>, 'is_primary': <bool>}, ...]
++
++        Only enabled secrets sign events; disabled and retired secrets are excluded. This
++        snapshot is fixed at enqueue time, so subsequent configuration changes (and job
++        retries) cannot alter the signature identity of an already-queued event.
++        """
++        return [
++            {
++                'key_id': secret.key_id,
++                'secret': secret.secret,
++                'is_primary': secret.is_primary,
++            }
++            for secret in self.secrets.filter(
++                status=WebhookSecretStatusChoices.STATUS_ENABLED
++            ).order_by('key_id')
++        ]
++
++    def sync_secrets(self, secrets):
++        """
++        Reconcile this webhook's signing secrets against the supplied list of dicts (each with
++        keys: key_id, secret, status, is_primary). Secrets whose key_id is absent from the list
++        are deleted. The data must have been validated beforehand via validate_signing_secrets().
++
++        Must be called within a transaction. is_primary is cleared on all rows first to avoid
++        violating the single-primary unique constraint while primary ownership is moving.
++        """
++        self.secrets.update(is_primary=False)
++        seen = set()
++        for data in secrets:
++            seen.add(data['key_id'])
++            WebhookSecret.objects.update_or_create(
++                webhook=self,
++                key_id=data['key_id'],
++                defaults={
++                    'secret': data['secret'],
++                    'status': data['status'],
++                    'is_primary': data['is_primary'],
++                },
++            )
++        self.secrets.exclude(key_id__in=seen).delete()
++
++
++# Signing-secret key IDs appear verbatim in the X-Hook-Signatures header, so restrict them to a
++# character set which keeps the "key_id=hexdigest" header format unambiguous.
++WEBHOOK_KEY_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
++
++
++def validate_signing_secrets(webhook, secrets):
++    """
++    Validate a desired set of signing secrets for a webhook.
++
++    :param webhook: The Webhook instance (may be unsaved for new objects, in which case no
++        persisted secrets exist yet).
++    :param secrets: A list of dicts, each with keys key_id, secret, status, is_primary.
++    :raises ValidationError: keyed under 'secrets', listing every problem found.
++
++    Enforced invariants:
++      * key_id is required, unique within the webhook, and limited to [A-Za-z0-9_-].
++      * secret is required for every key.
++      * When any secrets exist, exactly one is marked primary, and it must be enabled.
++      * A retired secret is terminal: it may be left as-is or deleted, but not re-enabled or
++        modified.
++    """
++    errors = []
++
++    existing = {}
++    if webhook.pk:
++        existing = {s.key_id: s for s in WebhookSecret.objects.filter(webhook=webhook)}
++
++    seen = set()
++    primary_count = 0
++    for index, data in enumerate(secrets, start=1):
++        key_id = (data.get('key_id') or '').strip()
++        secret = (data.get('secret') or '').strip()
++        status = data.get('status') or WebhookSecretStatusChoices.STATUS_ENABLED
++        is_primary = bool(data.get('is_primary'))
++
++        label = key_id or _('#{index}').format(index=index)
++
++        if not key_id:
++            errors.append(_('A key ID is required for each signing secret.'))
++        elif not WEBHOOK_KEY_ID_RE.match(key_id):
++            errors.append(_(
++                "Signing secret key ID '{key_id}' is invalid: only letters, numbers, hyphens, "
++                "and underscores are allowed."
++            ).format(key_id=key_id))
++        elif key_id in seen:
++            errors.append(_("Duplicate signing secret key ID '{key_id}'.").format(key_id=key_id))
++        seen.add(key_id)
++
++        if not secret:
++            errors.append(_("Signing secret '{key_id}' requires a secret value.").format(key_id=label))
++        elif len(secret) > 255:
++            errors.append(_("Signing secret '{key_id}' must be at most 255 characters.").format(key_id=label))
++
++        if status not in WebhookSecretStatusChoices.values():
++            errors.append(_("Signing secret '{key_id}' has an invalid status.").format(key_id=label))
++
++        if is_primary:
++            primary_count += 1
++            if status == WebhookSecretStatusChoices.STATUS_RETIRED:
++                errors.append(_(
++                    "Signing secret '{key_id}' cannot be retired while it is the primary key: "
++                    "designate another secret as primary first."
++                ).format(key_id=label))
++            elif status != WebhookSecretStatusChoices.STATUS_ENABLED:
++                errors.append(_("The primary signing secret ('{key_id}') must be enabled.").format(key_id=label))
++
++        # A retired secret is terminal: it may be left unchanged or deleted, but never modified.
++        persisted = existing.get(key_id)
++        if persisted is not None and persisted.status == WebhookSecretStatusChoices.STATUS_RETIRED:
++            if status != WebhookSecretStatusChoices.STATUS_RETIRED:
++                errors.append(_(
++                    "Signing secret '{key_id}' is retired and cannot be re-enabled: delete it or "
++                    "leave it retired."
++                ).format(key_id=key_id))
++            elif secret and secret != persisted.secret:
++                errors.append(_(
++                    "Signing secret '{key_id}' is retired and its secret value cannot be modified."
++                ).format(key_id=key_id))
++
++    if secrets and primary_count == 0:
++        errors.append(_('A primary signing secret is required when any signing secrets are defined.'))
++    elif primary_count > 1:
++        errors.append(_('Only one signing secret may be marked as primary.'))
++
++    if errors:
++        raise ValidationError({'secrets': errors})
++
++
++class WebhookSecret(models.Model):
++    """
++    A signing secret for a Webhook. Each webhook may hold multiple secrets identified by a stable
++    key_id to support key rotation with an overlap period during which receivers accept both old
++    and new keys. Exactly one enabled secret is designated primary.
++
++    Secrets are not change-logged (to avoid recording key material in change history) and are
++    managed through their parent webhook (UI form / REST API), not as standalone objects.
++    """
++    webhook = models.ForeignKey(
++        to=Webhook,
++        on_delete=models.CASCADE,
++        related_name='secrets',
++        verbose_name=_('webhook'),
++    )
++    key_id = models.CharField(
++        max_length=100,
++        verbose_name=_('key ID'),
++        help_text=_(
++            "A stable identifier for this secret, included in the <code>X-Hook-Signatures</code> "
++            "request header so receivers can select the matching key. May contain only letters, "
++            "numbers, hyphens, and underscores."
++        ),
++    )
++    secret = models.CharField(
++        max_length=255,
++        verbose_name=_('secret'),
++        help_text=_(
++            "When provided, the request will include an HMAC hex digest of the payload body "
++            "computed with this secret as the key. The secret itself is not transmitted in the "
++            "request."
++        ),
++    )
++    status = models.CharField(
++        max_length=20,
++        choices=WebhookSecretStatusChoices,
++        default=WebhookSecretStatusChoices.STATUS_ENABLED,
++        verbose_name=_('status'),
++        help_text=_(
++            "Enabled secrets sign outgoing requests. Disabled secrets are retained but do not "
++            "sign. Retired secrets are permanently out of service and no longer sign new events."
++        ),
++    )
++    is_primary = models.BooleanField(
++        default=False,
++        verbose_name=_('primary'),
++        help_text=_(
++            "The primary secret signs the legacy <code>X-Hook-Signature</code> header. Exactly one "
++            "enabled secret must be marked primary."
++        ),
++    )
++
++    class Meta:
++        ordering = ('key_id',)
++        constraints = (
++            models.UniqueConstraint(
++                fields=('webhook', 'key_id'),
++                name='extras_webhooksecret_unique_webhook_key_id',
++            ),
++            models.UniqueConstraint(
++                fields=('webhook',),
++                condition=models.Q(is_primary=True),
++                name='extras_webhooksecret_one_primary_per_webhook',
++            ),
++        )
++        verbose_name = _('webhook signing secret')
++        verbose_name_plural = _('webhook signing secrets')
++
++    def __str__(self):
++        return f'{self.webhook.name}/{self.key_id}'
++
++    def clean(self):
++        super().clean()
++
++        errors = {}
++        if not self.key_id:
++            errors['key_id'] = _('A key ID is required.')
++        elif not WEBHOOK_KEY_ID_RE.match(self.key_id):
++            errors['key_id'] = _('Only letters, numbers, hyphens, and underscores are allowed.')
++        if not self.secret:
++            errors['secret'] = _('A secret value is required.')
++        if self.is_primary and self.status != WebhookSecretStatusChoices.STATUS_ENABLED:
++            errors['is_primary'] = _('The primary signing secret must be enabled.')
++        if errors:
++            raise ValidationError(errors)
++
+ 
+ class CustomLink(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedModel):
+     """
+diff --git a/netbox/extras/tables/tables.py b/netbox/extras/tables/tables.py
+index 1816c9a49..166b35641 100644
+--- a/netbox/extras/tables/tables.py
++++ b/netbox/extras/tables/tables.py
+@@ -510,7 +510,7 @@ class WebhookTable(NetBoxTable):
+     class Meta(NetBoxTable.Meta):
+         model = Webhook
+         fields = (
+-            'pk', 'id', 'name', 'http_method', 'payload_url', 'http_content_type', 'secret', 'ssl_verification',
++            'pk', 'id', 'name', 'http_method', 'payload_url', 'http_content_type', 'ssl_verification',
+             'ca_file_path', 'timeout', 'description', 'tags', 'created', 'last_updated',
+         )
+         default_columns = (
+diff --git a/netbox/extras/tests/test_api.py b/netbox/extras/tests/test_api.py
+index 7e3e59b85..b88fbcad0 100644
+--- a/netbox/extras/tests/test_api.py
++++ b/netbox/extras/tests/test_api.py
+@@ -48,6 +48,9 @@ class WebhookTestCase(APIViewTestCases.APIViewTestCase):
+             'name': 'Webhook 4',
+             'payload_url': 'http://example.com/?4',
+             'timeout': 15,
++            'secrets': [
++                {'key_id': 'default', 'secret': 'secretstring', 'is_primary': True},
++            ],
+         },
+         {
+             'name': 'Webhook 5',
+@@ -82,6 +85,146 @@ class WebhookTestCase(APIViewTestCases.APIViewTestCase):
+         )
+         Webhook.objects.bulk_create(webhooks)
+ 
++    def test_secrets_serialization(self):
++        """The nested `secrets` field replaces the legacy `secret` field."""
++        webhook = Webhook.objects.create(name='Webhook Serialize', payload_url='http://example.com/')
++        WebhookSecret.objects.create(webhook=webhook, key_id='primary', secret='PRIM', is_primary=True)
++        WebhookSecret.objects.create(webhook=webhook, key_id='old', secret='OLD', status='retired')
++        self.add_permissions('extras.view_webhook')
++        url = reverse('extras-api:webhook-detail', kwargs={'pk': webhook.pk})
++        response = self.client.get(url, format='json', **self.header)
++        self.assertHttpStatus(response, status.HTTP_200_OK)
++        self.assertNotIn('secret', response.data)
++        secrets = {s['key_id']: s for s in response.data['secrets']}
++        self.assertEqual(set(secrets), {'primary', 'old'})
++        self.assertTrue(secrets['primary']['is_primary'])
++        self.assertEqual(secrets['primary']['secret'], 'PRIM')
++        self.assertEqual(secrets['old']['status']['value'], 'retired')
++
++    def test_create_with_multiple_secrets(self):
++        self.add_permissions('extras.add_webhook')
++        url = reverse('extras-api:webhook-list')
++        data = {
++            'name': 'Webhook Multi',
++            'payload_url': 'http://example.com/',
++            'secrets': [
++                {'key_id': 'old', 'secret': 'OLD', 'is_primary': True},
++                {'key_id': 'new', 'secret': 'NEW', 'is_primary': False},
++            ],
++        }
++        response = self.client.post(url, data, format='json', **self.header)
++        self.assertHttpStatus(response, status.HTTP_201_CREATED)
++        webhook = Webhook.objects.get(pk=response.data['id'])
++        self.assertEqual(
++            set(webhook.secrets.values_list('key_id', flat=True)),
++            {'old', 'new'},
++        )
++        self.assertEqual(webhook.secrets.get(is_primary=True).key_id, 'old')
++
++    def test_create_without_primary_rejected(self):
++        """No primary key: the request must fail and no webhook (nor key rows) be created."""
++        self.add_permissions('extras.add_webhook')
++        url = reverse('extras-api:webhook-list')
++        data = {
++            'name': 'Webhook No Primary',
++            'payload_url': 'http://example.com/',
++            'secrets': [
++                {'key_id': 'one', 'secret': 'A', 'is_primary': False},
++                {'key_id': 'two', 'secret': 'B', 'is_primary': False},
++            ],
++        }
++        with disable_warnings('django.request'):
++            response = self.client.post(url, data, format='json', **self.header)
++        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
++        self.assertIn('secrets', response.data)
++        self.assertFalse(Webhook.objects.filter(name='Webhook No Primary').exists())
++
++    def test_create_with_duplicate_key_id_rejected(self):
++        self.add_permissions('extras.add_webhook')
++        url = reverse('extras-api:webhook-list')
++        data = {
++            'name': 'Webhook Dup IDs',
++            'payload_url': 'http://example.com/',
++            'secrets': [
++                {'key_id': 'same', 'secret': 'A', 'is_primary': True},
++                {'key_id': 'same', 'secret': 'B', 'is_primary': False},
++            ],
++        }
++        with disable_warnings('django.request'):
++            response = self.client.post(url, data, format='json', **self.header)
++        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
++        self.assertFalse(Webhook.objects.filter(name='Webhook Dup IDs').exists())
++
++    def test_retire_primary_rejected(self):
++        """Retiring the current primary without promoting another key must fail atomically."""
++        webhook = Webhook.objects.create(name='Webhook Retire', payload_url='http://example.com/')
++        WebhookSecret.objects.create(webhook=webhook, key_id='old', secret='OLD', is_primary=True)
++        self.add_permissions('extras.change_webhook')
++        url = reverse('extras-api:webhook-detail', kwargs={'pk': webhook.pk})
++        data = {
++            'secrets': [
++                {'key_id': 'old', 'secret': 'OLD', 'status': 'retired', 'is_primary': False},
++            ],
++        }
++        with disable_warnings('django.request'):
++            response = self.client.patch(url, data, format='json', **self.header)
++        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
++        # No partial update: the old key is still enabled and primary.
++        webhook.refresh_from_db()
++        old = webhook.secrets.get(key_id='old')
++        self.assertEqual(old.status, 'enabled')
++        self.assertTrue(old.is_primary)
++
++    def test_rotate_secrets(self):
++        """
++        End-to-end rotation via the API: add a new enabled key, promote it to primary, then
++        retire the old key.
++        """
++        webhook = Webhook.objects.create(name='Webhook Rotate', payload_url='http://example.com/')
++        WebhookSecret.objects.create(webhook=webhook, key_id='old', secret='OLD', is_primary=True)
++        self.add_permissions('extras.change_webhook')
++        url = reverse('extras-api:webhook-detail', kwargs={'pk': webhook.pk})
++
++        # Overlap: both keys enabled, old key still primary.
++        with disable_warnings('django.request'):
++            response = self.client.patch(url, {
++                'secrets': [
++                    {'key_id': 'old', 'secret': 'OLD', 'status': 'enabled', 'is_primary': True},
++                    {'key_id': 'new', 'secret': 'NEW', 'status': 'enabled', 'is_primary': False},
++                ],
++            }, format='json', **self.header)
++        self.assertHttpStatus(response, status.HTTP_200_OK)
++        self.assertEqual(webhook.secrets.filter(status='enabled').count(), 2)
++
++        # Switch primary and retire the old key in one atomic update.
++        with disable_warnings('django.request'):
++            response = self.client.patch(url, {
++                'secrets': [
++                    {'key_id': 'new', 'secret': 'NEW', 'status': 'enabled', 'is_primary': True},
++                    {'key_id': 'old', 'secret': 'OLD', 'status': 'retired', 'is_primary': False},
++                ],
++            }, format='json', **self.header)
++        self.assertHttpStatus(response, status.HTTP_200_OK)
++        webhook.refresh_from_db()
++        self.assertEqual(webhook.secrets.get(is_primary=True).key_id, 'new')
++        old = webhook.secrets.get(key_id='old')
++        self.assertEqual(old.status, 'retired')
++        # Retired keys no longer sign newly enqueued events.
++        self.assertEqual(
++            {key['key_id'] for key in webhook.get_signing_keys_snapshot()},
++            {'new'},
++        )
++
++    def test_partial_update_without_secrets_leaves_keys_unchanged(self):
++        webhook = Webhook.objects.create(name='Webhook Partial', payload_url='http://example.com/')
++        WebhookSecret.objects.create(webhook=webhook, key_id='default', secret='SECRET', is_primary=True)
++        self.add_permissions('extras.change_webhook')
++        url = reverse('extras-api:webhook-detail', kwargs={'pk': webhook.pk})
++        response = self.client.patch(url, {'description': 'Changed'}, format='json', **self.header)
++        self.assertHttpStatus(response, status.HTTP_200_OK)
++        self.assertEqual(webhook.secrets.count(), 1)
++        self.assertEqual(webhook.secrets.get().secret, 'SECRET')
++
+ 
+ class EventRuleTestCase(APIViewTestCases.APIViewTestCase):
+     model = EventRule
+diff --git a/netbox/extras/tests/test_event_rules.py b/netbox/extras/tests/test_event_rules.py
+index 89bf1035d..c83996af5 100644
+--- a/netbox/extras/tests/test_event_rules.py
++++ b/netbox/extras/tests/test_event_rules.py
+@@ -23,10 +23,11 @@ from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices, SiteStatusCh
+ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+ from extras.choices import EventRuleActionChoices
+ from extras.events import enqueue_event, flush_events, process_event_rules, serialize_for_event
+-from extras.models import EventRule, Notification, Script, ScriptModule, Tag, Webhook
++from extras.models import EventRule, Notification, Script, ScriptModule, Tag, Webhook, WebhookSecret
++from extras.models.models import validate_signing_secrets
+ from extras.scripts import Script as ScriptBase
+ from extras.signals import process_job_end_event_rules
+-from extras.webhooks import generate_signature, send_webhook
++from extras.webhooks import SIGNATURES_HEADER, generate_signature, send_webhook
+ from ipam.choices import IPAddressStatusChoices
+ from ipam.models import IPAddress, Prefix
+ from netbox.context_managers import event_tracking
+@@ -76,9 +77,16 @@ class EventRuleTestCase(RQQueueTestMixin, APITestCase):
+         DUMMY_SECRET = 'LOOKATMEIMASECRETSTRING'
+ 
+         webhooks = Webhook.objects.bulk_create((
+-            Webhook(name='Webhook 1', payload_url=DUMMY_URL, secret=DUMMY_SECRET, additional_headers='X-Foo: Bar'),
+-            Webhook(name='Webhook 2', payload_url=DUMMY_URL, secret=DUMMY_SECRET),
+-            Webhook(name='Webhook 3', payload_url=DUMMY_URL, secret=DUMMY_SECRET),
++            Webhook(name='Webhook 1', payload_url=DUMMY_URL, additional_headers='X-Foo: Bar'),
++            Webhook(name='Webhook 2', payload_url=DUMMY_URL),
++            Webhook(name='Webhook 3', payload_url=DUMMY_URL),
++        ))
++        # Each webhook carries a single primary signing secret, equivalent to a webhook migrated
++        # from the legacy single-secret configuration.
++        WebhookSecret.objects.bulk_create((
++            WebhookSecret(webhook=webhooks[0], key_id='default', secret=DUMMY_SECRET, is_primary=True),
++            WebhookSecret(webhook=webhooks[1], key_id='default', secret=DUMMY_SECRET, is_primary=True),
++            WebhookSecret(webhook=webhooks[2], key_id='default', secret=DUMMY_SECRET, is_primary=True),
+         ))
+ 
+         webhook_type = ObjectType.objects.get(app_label='extras', model='webhook')
+@@ -674,11 +682,17 @@ class EventRuleTestCase(RQQueueTestMixin, APITestCase):
+             """
+             event = EventRule.objects.get(name='Event Rule 1')
+             webhook = event.action_object
+-            signature = generate_signature(request.body, webhook.secret)
++            primary_secret = webhook.secrets.get(is_primary=True).secret
++            signature = generate_signature(request.body, primary_secret)
+ 
+-            # Validate the outgoing request headers
++            # Validate the outgoing request headers. The primary key's signature appears in both
++            # the legacy X-Hook-Signature header and the keyed X-Hook-Signatures header.
+             self.assertEqual(request.headers['Content-Type'], webhook.http_content_type)
+             self.assertEqual(request.headers['X-Hook-Signature'], signature)
++            self.assertEqual(
++                request.headers[SIGNATURES_HEADER],
++                f'default={signature}',
++            )
+             self.assertEqual(request.headers['X-Foo'], 'Bar')
+ 
+             # The webhook does not define its own timeout, so the global default should be used
+@@ -818,6 +832,157 @@ class EventRuleTestCase(RQQueueTestMixin, APITestCase):
+ 
+         self.assertIn(f'timed out after {settings.WEBHOOK_DEFAULT_TIMEOUT} seconds', cm.output[0])
+ 
++    def _enqueue_webhook_job(self, webhook=None):
++        """
++        Enqueue a created-site event and return the kwargs of the resulting send_webhook job.
++        If `webhook` is given, the enqueued job for that webhook is returned; otherwise the only
++        job in the queue.
++        """
++        request = RequestFactory().get(reverse('dcim:site_add'))
++        request.id = uuid.uuid4()
++        request.user = self.user
++
++        webhooks_queue = {}
++        site = Site.objects.create(name='Site 1', slug='site-1')
++        enqueue_event(webhooks_queue, instance=site, request=request, event_type=OBJECT_CREATED)
++        flush_events(list(webhooks_queue.values()))
++
++        jobs = self.queue.jobs
++        if webhook is not None:
++            jobs = [job for job in jobs if job.kwargs['event_rule'].action_object == webhook]
++        return jobs[0].kwargs
++
++    def test_enqueue_snapshots_signing_keys(self):
++        """
++        Enqueuing a webhook job freezes the enabled signing keys (key_id, secret, primary flag)
++        into the job parameters; disabled and retired keys are excluded.
++        """
++        webhook = Webhook.objects.get(name='Webhook 1')
++        WebhookSecret.objects.create(webhook=webhook, key_id='rotated', secret='NEWSECRET', is_primary=False)
++        WebhookSecret.objects.create(
++            webhook=webhook, key_id='staged', secret='STAGED', status='disabled', is_primary=False
++        )
++
++        job_kwargs = self._enqueue_webhook_job(webhook)
++
++        self.assertEqual(
++            {key['key_id'] for key in job_kwargs['signing_keys']},
++            {'default', 'rotated'},
++        )
++        default_key = next(key for key in job_kwargs['signing_keys'] if key['key_id'] == 'default')
++        rotated_key = next(key for key in job_kwargs['signing_keys'] if key['key_id'] == 'rotated')
++        self.assertTrue(default_key['is_primary'])
++        self.assertFalse(rotated_key['is_primary'])
++        self.assertEqual(default_key['secret'], 'LOOKATMEIMASECRETSTRING')
++        self.assertEqual(rotated_key['secret'], 'NEWSECRET')
++
++    def test_send_webhook_multiple_signing_secrets(self):
++        """
++        With multiple enabled keys, every key signs the final request body and appears in the
++        X-Hook-Signatures header, while X-Hook-Signature carries the primary key's signature.
++        """
++        webhook = Webhook.objects.get(name='Webhook 1')
++        WebhookSecret.objects.create(webhook=webhook, key_id='rotated', secret='NEWSECRET', is_primary=False)
++
++        def dummy_send(_, request, **kwargs):
++            entries = dict(
++                entry.split('=', 1) for entry in request.headers[SIGNATURES_HEADER].split(',')
++            )
++            # Both enabled keys sign the (final) request body, each with its own secret.
++            self.assertEqual(set(entries), {'default', 'rotated'})
++            self.assertEqual(entries['default'], generate_signature(request.body, 'LOOKATMEIMASECRETSTRING'))
++            self.assertEqual(entries['rotated'], generate_signature(request.body, 'NEWSECRET'))
++            # The legacy header continues to carry the primary key's signature.
++            self.assertEqual(request.headers['X-Hook-Signature'], entries['default'])
++            return HttpResponse()
++
++        job_kwargs = self._enqueue_webhook_job(webhook)
++        with patch.object(Session, 'send', dummy_send):
++            send_webhook(**job_kwargs)
++
++    def test_send_webhook_unsigned_when_no_secrets(self):
++        """
++        A webhook without signing secrets sends no signature headers at all.
++        """
++        unsigned = Webhook.objects.create(name='Webhook Unsigned', payload_url='http://localhost:9000/')
++        webhook_type = ObjectType.objects.get_for_model(Webhook)
++        event_rule = EventRule.objects.create(
++            name='Event Rule Unsigned',
++            event_types=[OBJECT_CREATED],
++            action_type=EventRuleActionChoices.WEBHOOK,
++            action_object_type=webhook_type,
++            action_object_id=unsigned.pk,
++        )
++        event_rule.object_types.set([ObjectType.objects.get_for_model(Site)])
++
++        def dummy_send(_, request, **kwargs):
++            self.assertNotIn('X-Hook-Signature', request.headers)
++            self.assertNotIn(SIGNATURES_HEADER, request.headers)
++            return HttpResponse()
++
++        job_kwargs = self._enqueue_webhook_job(unsigned)
++        with patch.object(Session, 'send', dummy_send):
++            send_webhook(**job_kwargs)
++
++    def test_signing_identity_frozen_at_enqueue(self):
++        """
++        The signing keys are snapshotted at enqueue time. Retiring a key (or adding a new one)
++        after the event is queued must not alter the signatures the job sends, and automatic
++        retries reuse the same snapshot.
++        """
++        webhook = Webhook.objects.get(name='Webhook 1')
++        WebhookSecret.objects.create(webhook=webhook, key_id='rotated', secret='NEWSECRET', is_primary=False)
++
++        job_kwargs = self._enqueue_webhook_job(webhook)
++        snapshot_ids = {key['key_id'] for key in job_kwargs['signing_keys']}
++        self.assertEqual(snapshot_ids, {'default', 'rotated'})
++
++        # Rotate after enqueue: retire the old primary, promote the new key, add a third key.
++        webhook.sync_secrets([
++            {'key_id': 'rotated', 'secret': 'NEWSECRET', 'status': 'enabled', 'is_primary': True},
++            {'key_id': 'added-later', 'secret': 'LATERSECRET', 'status': 'enabled', 'is_primary': False},
++            {'key_id': 'default', 'secret': 'LOOKATMEIMASECRETSTRING', 'status': 'retired', 'is_primary': False},
++        ])
++
++        # The queued job's snapshot is unchanged by the configuration change.
++        self.assertEqual({key['key_id'] for key in job_kwargs['signing_keys']}, {'default', 'rotated'})
++
++        def dummy_send(_, request, **kwargs):
++            entries = dict(
++                entry.split('=', 1) for entry in request.headers[SIGNATURES_HEADER].split(',')
++            )
++            # Retired-at-send-time key still signs (it was enabled at enqueue); the key added
++            # after enqueue does not.
++            self.assertEqual(set(entries), {'default', 'rotated'})
++            self.assertEqual(entries['default'], generate_signature(request.body, 'LOOKATMEIMASECRETSTRING'))
++            self.assertEqual(entries['rotated'], generate_signature(request.body, 'NEWSECRET'))
++            self.assertNotIn('added-later', entries)
++            # Legacy header reflects the snapshot's primary (the old key), not the new config.
++            self.assertEqual(request.headers['X-Hook-Signature'], entries['default'])
++            return HttpResponse()
++
++        with patch.object(Session, 'send', dummy_send):
++            send_webhook(**job_kwargs)
++
++    def test_legacy_job_without_snapshot_uses_live_config(self):
++        """
++        A job enqueued before multi-secret support carries no signing_keys snapshot. The send
++        falls back to the webhook's current keys (matching the legacy live-read behavior).
++        """
++        webhook = Webhook.objects.get(name='Webhook 1')
++
++        def dummy_send(_, request, **kwargs):
++            self.assertEqual(
++                request.headers['X-Hook-Signature'],
++                generate_signature(request.body, 'LOOKATMEIMASECRETSTRING'),
++            )
++            return HttpResponse()
++
++        job_kwargs = self._enqueue_webhook_job(webhook)
++        job_kwargs['signing_keys'] = None  # Simulate a pre-upgrade job
++        with patch.object(Session, 'send', dummy_send):
++            send_webhook(**job_kwargs)
++
+     def test_job_completed_webhook_without_request(self):
+         """
+         Ensure job_end event processing can enqueue a webhook even when the EventContext
+@@ -1906,6 +2071,132 @@ class EventRuleNoObjectActionTestCase(TestCase):
+         self.assertIsNone(rule.action_object)
+ 
+ 
++class WebhookSecretValidationTestCase(TestCase):
++    """
++    Tests for the shared signing-secret validation used by both the UI form and the REST API.
++    """
++
++    @classmethod
++    def setUpTestData(cls):
++        cls.webhook = Webhook.objects.create(name='Webhook', payload_url='http://example.com/')
++
++    def assertInvalid(self, keys):
++        with self.assertRaises(ValidationError) as cm:
++            validate_signing_secrets(self.webhook, keys)
++        return cm.exception
++
++    def assertValid(self, keys):
++        validate_signing_secrets(self.webhook, keys)
++
++    def test_empty_set_is_valid(self):
++        """A webhook without secrets remains unsigned, which is a valid state."""
++        self.assertValid([])
++
++    def test_single_primary_enabled_is_valid(self):
++        self.assertValid([
++            {'key_id': 'primary', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
++        ])
++
++    def test_two_enabled_keys_with_primary_is_valid(self):
++        self.assertValid([
++            {'key_id': 'old', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
++            {'key_id': 'new', 'secret': 'b', 'status': 'enabled', 'is_primary': False},
++        ])
++
++    def test_missing_primary_rejected(self):
++        self.assertInvalid([
++            {'key_id': 'old', 'secret': 'a', 'status': 'enabled', 'is_primary': False},
++            {'key_id': 'new', 'secret': 'b', 'status': 'enabled', 'is_primary': False},
++        ])
++
++    def test_multiple_primaries_rejected(self):
++        self.assertInvalid([
++            {'key_id': 'old', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
++            {'key_id': 'new', 'secret': 'b', 'status': 'enabled', 'is_primary': True},
++        ])
++
++    def test_disabled_primary_rejected(self):
++        self.assertInvalid([
++            {'key_id': 'old', 'secret': 'a', 'status': 'disabled', 'is_primary': True},
++            {'key_id': 'new', 'secret': 'b', 'status': 'enabled', 'is_primary': False},
++        ])
++
++    def test_duplicate_key_ids_rejected(self):
++        self.assertInvalid([
++            {'key_id': 'same', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
++            {'key_id': 'same', 'secret': 'b', 'status': 'enabled', 'is_primary': False},
++        ])
++
++    def test_blank_key_id_rejected(self):
++        self.assertInvalid([
++            {'key_id': '  ', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
++        ])
++
++    def test_invalid_key_id_characters_rejected(self):
++        self.assertInvalid([
++            {'key_id': 'bad id!', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
++        ])
++
++    def test_blank_secret_rejected(self):
++        self.assertInvalid([
++            {'key_id': 'primary', 'secret': '   ', 'status': 'enabled', 'is_primary': True},
++        ])
++
++    def test_retire_primary_rejected(self):
++        self.assertInvalid([
++            {'key_id': 'old', 'secret': 'a', 'status': 'retired', 'is_primary': True},
++        ])
++
++    def test_retired_key_is_terminal(self):
++        # The existing key has been retired; a current enabled key is primary.
++        WebhookSecret.objects.create(
++            webhook=self.webhook, key_id='current', secret='CUR', status='enabled', is_primary=True
++        )
++        WebhookSecret.objects.create(
++            webhook=self.webhook, key_id='old', secret='OLD', status='retired', is_primary=False
++        )
++
++        # Re-enabling a retired key is rejected.
++        self.assertInvalid([
++            {'key_id': 'current', 'secret': 'CUR', 'status': 'enabled', 'is_primary': True},
++            {'key_id': 'old', 'secret': 'OLD', 'status': 'enabled', 'is_primary': False},
++        ])
++
++        # Changing a retired key's secret is rejected.
++        self.assertInvalid([
++            {'key_id': 'current', 'secret': 'CUR', 'status': 'enabled', 'is_primary': True},
++            {'key_id': 'old', 'secret': 'CHANGED', 'status': 'retired', 'is_primary': False},
++        ])
++
++        # Leaving the retired key as-is (or omitting it to delete it) is valid.
++        self.assertValid([
++            {'key_id': 'current', 'secret': 'CUR', 'status': 'enabled', 'is_primary': True},
++            {'key_id': 'old', 'secret': 'OLD', 'status': 'retired', 'is_primary': False},
++        ])
++        self.assertValid([
++            {'key_id': 'current', 'secret': 'CUR', 'status': 'enabled', 'is_primary': True},
++        ])
++
++    def test_snapshot_contains_enabled_keys_only(self):
++        WebhookSecret.objects.create(
++            webhook=self.webhook, key_id='primary', secret='A', status='enabled', is_primary=True
++        )
++        WebhookSecret.objects.create(
++            webhook=self.webhook, key_id='enabled', secret='B', status='enabled', is_primary=False
++        )
++        WebhookSecret.objects.create(
++            webhook=self.webhook, key_id='disabled', secret='C', status='disabled', is_primary=False
++        )
++        WebhookSecret.objects.create(
++            webhook=self.webhook, key_id='retired', secret='D', status='retired', is_primary=False
++        )
++
++        snapshot = self.webhook.get_signing_keys_snapshot()
++        self.assertEqual({k['key_id'] for k in snapshot}, {'primary', 'enabled'})
++        self.assertEqual(snapshot[0]['key_id'], 'enabled')  # ordered by key_id
++        self.assertTrue(next(k for k in snapshot if k['key_id'] == 'primary')['is_primary'])
++
++
+ class WebhookRenderHeadersTest(TestCase):
+ 
+     def test_render_headers(self):
+diff --git a/netbox/extras/tests/test_signals.py b/netbox/extras/tests/test_signals.py
+index 82e601c89..61e63e0bd 100644
+--- a/netbox/extras/tests/test_signals.py
++++ b/netbox/extras/tests/test_signals.py
+@@ -12,7 +12,7 @@ from dcim.choices import SiteStatusChoices
+ from dcim.models import Region, Site
+ from extras import signals
+ from extras.choices import CustomFieldTypeChoices, EventRuleActionChoices
+-from extras.models import CustomField, EventRule, Notification, Subscription, Tag, Webhook
++from extras.models import CustomField, EventRule, Notification, Subscription, Tag, Webhook, WebhookSecret
+ from extras.validators import CustomValidator
+ from netbox.context_managers import event_tracking
+ from users.models import User
+@@ -175,8 +175,8 @@ class JobEventRulesSignalTestCase(TestCase):
+         webhook = Webhook.objects.create(
+             name='Webhook',
+             payload_url='http://localhost/',
+-            secret='secret',
+         )
++        WebhookSecret.objects.create(webhook=webhook, key_id='default', secret='secret', is_primary=True)
+         webhook_type = ObjectType.objects.get_for_model(Webhook)
+         cls.start_rule = EventRule.objects.create(
+             name='Job Start Rule',
+diff --git a/netbox/extras/tests/test_views.py b/netbox/extras/tests/test_views.py
+index 219069dee..463ce696f 100644
+--- a/netbox/extras/tests/test_views.py
++++ b/netbox/extras/tests/test_views.py
+@@ -703,6 +703,77 @@ class WebhookTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+             'timeout': 60,
+         }
+ 
++    def _secrets_form_data(self, rows, primary_index=None):
++        """
++        Build POST data for the signing-secret editor widget for the given list of
++        (key_id, secret, status) rows.
++        """
++        return {
++            'secrets_key_id': [row[0] for row in rows],
++            'secrets_secret': [row[1] for row in rows],
++            'secrets_status': [row[2] for row in rows],
++            'secrets_primary': str(primary_index) if primary_index is not None else '',
++        }
++
++    def test_create_with_signing_secrets(self):
++        data = {
++            'name': 'Webhook Keys',
++            'payload_url': 'http://example.com/',
++            'http_method': 'POST',
++            'http_content_type': 'application/json',
++            **self._secrets_form_data([
++                ('old', 'OLD', 'enabled'),
++                ('new', 'NEW', 'enabled'),
++            ], primary_index=0),
++        }
++        response = self.client.post(reverse('extras:webhook_add'), data)
++        self.assertEqual(response.status_code, 302)
++        webhook = Webhook.objects.get(name='Webhook Keys')
++        self.assertEqual(set(webhook.secrets.values_list('key_id', flat=True)), {'old', 'new'})
++        self.assertEqual(webhook.secrets.get(is_primary=True).key_id, 'old')
++
++    def test_create_without_primary_rejected(self):
++        data = {
++            'name': 'Webhook No Primary',
++            'payload_url': 'http://example.com/',
++            'http_method': 'POST',
++            'http_content_type': 'application/json',
++            **self._secrets_form_data([
++                ('one', 'A', 'enabled'),
++                ('two', 'B', 'enabled'),
++            ], primary_index=None),
++        }
++        response = self.client.post(reverse('extras:webhook_add'), data)
++        # Form re-renders with validation errors; no object is created.
++        self.assertEqual(response.status_code, 200)
++        self.assertFalse(Webhook.objects.filter(name='Webhook No Primary').exists())
++
++    def test_edit_rotates_and_retires_secret(self):
++        webhook = Webhook.objects.create(name='Webhook Rotate UI', payload_url='http://example.com/')
++        WebhookSecret.objects.create(webhook=webhook, key_id='old', secret='OLD', is_primary=True)
++
++        data = {
++            'name': 'Webhook Rotate UI',
++            'payload_url': 'http://example.com/',
++            'http_method': 'POST',
++            'http_content_type': 'application/json',
++            'ssl_verification': True,
++            **self._secrets_form_data([
++                ('new', 'NEW', 'enabled'),
++                ('old', 'OLD', 'retired'),
++            ], primary_index=0),
++        }
++        response = self.client.post(reverse('extras:webhook_edit', kwargs={'pk': webhook.pk}), data)
++        self.assertEqual(response.status_code, 302)
++        webhook.refresh_from_db()
++        self.assertEqual(webhook.secrets.get(is_primary=True).key_id, 'new')
++        self.assertEqual(webhook.secrets.get(key_id='old').status, 'retired')
++        # Retired keys no longer appear in enqueue snapshots.
++        self.assertEqual(
++            {key['key_id'] for key in webhook.get_signing_keys_snapshot()},
++            {'new'},
++        )
++
+ 
+ class EventRulesTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+     model = EventRule
+diff --git a/netbox/extras/ui/panels.py b/netbox/extras/ui/panels.py
+index 375cd4dea..60e491d36 100644
+--- a/netbox/extras/ui/panels.py
++++ b/netbox/extras/ui/panels.py
+@@ -2,6 +2,7 @@ from django.conf import settings
+ from django.contrib.contenttypes.models import ContentType
+ from django.utils.translation import gettext_lazy as _
+ 
++from extras.choices import WebhookSecretStatusChoices
+ from netbox.ui import actions, attrs, panels
+ from utilities.data import resolve_attr_path
+ 
+@@ -44,6 +45,7 @@ __all__ = (
+     'WebhookHTTPPanel',
+     'WebhookPanel',
+     'WebhookSSLPanel',
++    'WebhookSecretsPanel',
+ )
+ 
+ 
+@@ -352,10 +354,34 @@ class WebhookHTTPPanel(panels.ObjectAttributesPanel):
+     http_method = attrs.ChoiceAttr('http_method', label=_('HTTP method'))
+     payload_url = attrs.TextAttr('payload_url', label=_('Payload URL'), style='font-monospace')
+     http_content_type = attrs.TextAttr('http_content_type', label=_('HTTP content type'))
+-    secret = attrs.TextAttr('secret')
+     timeout = WebhookTimeoutAttr('timeout')
+ 
+ 
++class WebhookSecretsPanel(panels.ObjectPanel):
++    """
++    Renders the webhook's signing secrets, including key ID, status, and primary designation.
++    """
++    title = _('Signing Secrets')
++    template_name = 'extras/panels/webhook_secrets.html'
++
++    def get_context(self, context):
++        status_colors = {choice.value: choice.color for choice in WebhookSecretStatusChoices.CHOICES}
++        secrets = [
++            {
++                'key_id': secret.key_id,
++                'secret': secret.secret,
++                'is_primary': secret.is_primary,
++                'status_label': secret.get_status_display(),
++                'status_color': status_colors.get(secret.status),
++            }
++            for secret in context['object'].secrets.all()
++        ]
++        return {
++            **super().get_context(context),
++            'secrets': secrets,
++        }
++
++
+ class WebhookSSLPanel(panels.ObjectAttributesPanel):
+     title = _('SSL')
+ 
+diff --git a/netbox/extras/views.py b/netbox/extras/views.py
+index 9fe810743..7f00abebb 100644
+--- a/netbox/extras/views.py
++++ b/netbox/extras/views.py
+@@ -771,6 +771,7 @@ class WebhookView(generic.ObjectView):
+         left_panels=[
+             panels.WebhookPanel(),
+             panels.WebhookHTTPPanel(),
++            panels.WebhookSecretsPanel(),
+             panels.WebhookSSLPanel(),
+         ],
+         right_panels=[
+diff --git a/netbox/extras/webhooks.py b/netbox/extras/webhooks.py
+index 001a1512f..6a5b90c2b 100644
+--- a/netbox/extras/webhooks.py
++++ b/netbox/extras/webhooks.py
+@@ -22,6 +22,12 @@ __all__ = (
+ 
+ logger = logging.getLogger('netbox.webhooks')
+ 
++# Header carrying the signature of the primary signing key (backward compatible).
++SIGNATURE_HEADER = 'X-Hook-Signature'
++# Header carrying one signature per enabled key, keyed by the key's stable identifier,
++# as comma-separated "<key_id>=<hexdigest>" entries.
++SIGNATURES_HEADER = 'X-Hook-Signatures'
++
+ 
+ def register_webhook_callback(func):
+     """
+@@ -44,8 +50,33 @@ def generate_signature(request_body, secret):
+     return hmac_prep.hexdigest()
+ 
+ 
++def sign_request(prepared_request, signing_keys):
++    """
++    Attach HMAC signatures of the (final) request body to the prepared request headers.
++
++    :param signing_keys: A list of {'key_id', 'secret', 'is_primary'} dicts, as snapshotted at
++        enqueue time. Each enabled key produces an entry in the X-Hook-Signatures header; the
++        primary key additionally signs the legacy X-Hook-Signature header. When empty, no
++        signature headers are added (the webhook has no signing secrets configured).
++    """
++    if not signing_keys:
++        return
++
++    signatures = {
++        key['key_id']: generate_signature(prepared_request.body, key['secret'])
++        for key in signing_keys
++    }
++    primary_key = next((key for key in signing_keys if key.get('is_primary')), None)
++    if primary_key is not None:
++        prepared_request.headers[SIGNATURE_HEADER] = signatures[primary_key['key_id']]
++    prepared_request.headers[SIGNATURES_HEADER] = ','.join(
++        f'{key_id}={signature}' for key_id, signature in signatures.items()
++    )
++
++
+ @job('default')
+-def send_webhook(event_rule, object_type, event_type, data, timestamp, request=None, snapshots=None):
++def send_webhook(event_rule, object_type, event_type, data, timestamp, request=None, snapshots=None,
++                signing_keys=None):
+     """
+     Make a POST request to the defined Webhook
+     """
+@@ -110,9 +141,13 @@ def send_webhook(event_rule, object_type, event_type, data, timestamp, request=N
+         logger.error(f"Error forming HTTP request: {e}")
+         raise e
+ 
+-    # If a secret key is defined, sign the request with a hash of the key and its content
+-    if webhook.secret != '':
+-        prepared_request.headers['X-Hook-Signature'] = generate_signature(prepared_request.body, webhook.secret)
++    # Sign the request using the signing keys snapshotted when the event was enqueued. Jobs
++    # enqueued before multi-secret support (which carry no snapshot) fall back to the webhook's
++    # current signing configuration, matching the legacy behavior of reading the secret at send
++    # time.
++    if signing_keys is None:
++        signing_keys = webhook.get_signing_keys_snapshot()
++    sign_request(prepared_request, signing_keys)
+ 
+     # Determine the request timeout, preferring the webhook-specific value over the global default
+     timeout = webhook.timeout if webhook.timeout is not None else settings.WEBHOOK_DEFAULT_TIMEOUT
+diff --git a/netbox/templates/extras/panels/webhook_secrets.html b/netbox/templates/extras/panels/webhook_secrets.html
+new file mode 100644
+index 000000000..afa500586
+--- /dev/null
++++ b/netbox/templates/extras/panels/webhook_secrets.html
+@@ -0,0 +1,44 @@
++{% extends "ui/panels/_base.html" %}
++{% load helpers %}
++{% load i18n %}
++
++{% block panel_content %}
++  {% if secrets %}
++    <table class="table table-hover">
++      <thead>
++        <tr>
++          <th>{% trans "Key ID" %}</th>
++          <th>{% trans "Status" %}</th>
++          <th>{% trans "Primary" %}</th>
++          <th>{% trans "Secret" %}</th>
++        </tr>
++      </thead>
++      <tbody>
++        {% for secret in secrets %}
++          <tr>
++            <td class="font-monospace">{{ secret.key_id }}</td>
++            <td>
++              {% if secret.status_color %}
++                {% badge secret.status_label bg_color=secret.status_color %}
++              {% else %}
++                {{ secret.status_label }}
++              {% endif %}
++            </td>
++            <td>
++              {% if secret.is_primary %}
++                {% checkmark True %}
++              {% else %}
++                {{ ''|placeholder }}
++              {% endif %}
++            </td>
++            <td class="font-monospace text-truncate" style="max-width: 280px;">{{ secret.secret }}</td>
++          </tr>
++        {% endfor %}
++      </tbody>
++    </table>
++  {% else %}
++    <div class="list-group-item text-muted">
++      {% trans "No signing secrets configured; requests are sent without signature headers." %}
++    </div>
++  {% endif %}
++{% endblock panel_content %}
+diff --git a/netbox/templates/extras/widgets/webhook_secrets.html b/netbox/templates/extras/widgets/webhook_secrets.html
+new file mode 100644
+index 000000000..0c19b1fae
+--- /dev/null
++++ b/netbox/templates/extras/widgets/webhook_secrets.html
+@@ -0,0 +1,81 @@
++<table class="table table-hover table-sm">
++  <thead>
++    <tr>
++      <th class="w-5">Primary</th>
++      <th class="w-25">Key ID</th>
++      <th class="w-30">Secret</th>
++      <th class="w-20">Status</th>
++      <th class="w-5 text-end">Delete</th>
++    </tr>
++  </thead>
++  <tbody>
++    {% for row in widget.rows %}
++      <tr {% if row.retired %}class="table-secondary"{% endif %}>
++        <td class="align-middle">
++          <div class="form-check mb-0">
++            <input
++              type="radio"
++              class="form-check-input"
++              name="{{ widget.name }}_primary"
++              value="{{ row.index }}"
++              id="{{ widget.name }}_primary_{{ row.index }}"
++              {% if row.is_primary %}checked{% endif %}
++              {% if row.retired %}disabled{% endif %}
++            />
++          </div>
++        </td>
++        <td>
++          <input
++            type="text"
++            class="form-control font-monospace{% if row.retired %} bg-light{% endif %}"
++            name="{{ widget.name }}_key_id"
++            value="{{ row.key_id }}"
++            maxlength="100"
++            {% if row.retired %}readonly{% endif %}
++          />
++        </td>
++        <td>
++          <input
++            type="text"
++            class="form-control font-monospace{% if row.retired %} bg-light{% endif %}"
++            name="{{ widget.name }}_secret"
++            value="{{ row.secret }}"
++            maxlength="255"
++            {% if row.retired %}readonly{% endif %}
++          />
++        </td>
++        <td>
++          {% if row.retired %}
++            <span class="badge text-bg-danger">Retired</span>
++            <input type="hidden" name="{{ widget.name }}_status" value="retired" />
++          {% else %}
++            <select class="form-select" name="{{ widget.name }}_status">
++              {% for value, label in row.status_choices %}
++                <option value="{{ value }}"{% if value == row.status %} selected{% endif %}>{{ label }}</option>
++              {% endfor %}
++            </select>
++          {% endif %}
++        </td>
++        <td class="align-middle text-end">
++          {% if not row.blank %}
++            <div class="form-check mb-0 d-inline-block">
++              <input
++                type="checkbox"
++                class="form-check-input"
++                name="{{ widget.name }}_delete"
++                value="{{ row.key_id }}"
++                id="{{ widget.name }}_delete_{{ row.index }}"
++              />
++            </div>
++          {% endif %}
++        </td>
++      </tr>
++    {% endfor %}
++  </tbody>
++</table>
++<p class="text-muted small mb-0">
++  Key IDs may contain only letters, numbers, hyphens, and underscores. Every webhook with secrets must have exactly
++  one enabled <strong>primary</strong> secret, which also signs the legacy <code>X-Hook-Signature</code> header; all
++  enabled secrets appear in the <code>X-Hook-Signatures</code> header. Retired secrets never sign new events and
++  cannot be modified, but remain listed until deleted.
++</p>

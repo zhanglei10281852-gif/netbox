@@ -35,6 +35,12 @@ class WebhookAction(EventRuleAction):
         queue_name = get_config().QUEUE_MAPPINGS.get('webhook', RQ_QUEUE_DEFAULT)
         rq_queue = get_queue(queue_name)
 
+        # Snapshot the signing keys *now*, while the event is being enqueued, and persist them in
+        # the job parameters. This freezes the signature identity for this event: later changes to
+        # the webhook's signing secrets (retirement, rotation) and automatic job retries all send
+        # exactly the signatures determined at enqueue time.
+        signing_keys = action_object.get_signing_keys_snapshot()
+
         # Compile the task parameters
         params = {
             'event_rule': event_rule,
@@ -43,6 +49,7 @@ class WebhookAction(EventRuleAction):
             'data': action_data,
             'snapshots': event_context.get('snapshots'),
             'timestamp': timezone.now().isoformat(),
+            'signing_keys': signing_keys,
             'retry': get_rq_retry(),
         }
         if 'request' in event_context:

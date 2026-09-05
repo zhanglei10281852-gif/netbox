@@ -54,6 +54,8 @@ __all__ = (
     'SavedFilter',
     'TableConfig',
     'Webhook',
+    'WebhookSecret',
+    'validate_signing_secrets',
 )
 
 # Matches a literal URL scheme (RFC 3986), independent of urlsplit()'s netloc parsing -- which can
@@ -266,15 +268,6 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
             "<code>timestamp</code>, <code>request</code>, and <code>data</code>."
         )
     )
-    secret = models.CharField(
-        verbose_name=_('secret'),
-        max_length=255,
-        blank=True,
-        help_text=_(
-            "When provided, the request will include a <code>X-Hook-Signature</code> header containing a HMAC hex "
-            "digest of the payload body using the secret as the key. The secret is not transmitted in the request."
-        )
-    )
     ssl_verification = models.BooleanField(
         default=True,
         verbose_name=_('SSL verification'),
@@ -405,6 +398,227 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
         Render the payload URL.
         """
         return render_jinja2(self.payload_url, context)
+
+    def get_signing_keys_snapshot(self):
+        """
+        Return the set of signing keys to use for an event enqueued *now*, as a list of plain
+        dicts suitable for pickling into the background job's parameters:
+
+            [{'key_id': <str>, 'secret': <str>, 'is_primary': <bool>}, ...]
+
+        Only enabled secrets sign events; disabled and retired secrets are excluded. This
+        snapshot is fixed at enqueue time, so subsequent configuration changes (and job
+        retries) cannot alter the signature identity of an already-queued event.
+        """
+        return [
+            {
+                'key_id': secret.key_id,
+                'secret': secret.secret,
+                'is_primary': secret.is_primary,
+            }
+            for secret in self.secrets.filter(
+                status=WebhookSecretStatusChoices.STATUS_ENABLED
+            ).order_by('key_id')
+        ]
+
+    def sync_secrets(self, secrets):
+        """
+        Reconcile this webhook's signing secrets against the supplied list of dicts (each with
+        keys: key_id, secret, status, is_primary). Secrets whose key_id is absent from the list
+        are deleted. The data must have been validated beforehand via validate_signing_secrets().
+
+        Must be called within a transaction. is_primary is cleared on all rows first to avoid
+        violating the single-primary unique constraint while primary ownership is moving.
+        """
+        self.secrets.update(is_primary=False)
+        seen = set()
+        for data in secrets:
+            seen.add(data['key_id'])
+            WebhookSecret.objects.update_or_create(
+                webhook=self,
+                key_id=data['key_id'],
+                defaults={
+                    'secret': data['secret'],
+                    'status': data['status'],
+                    'is_primary': data['is_primary'],
+                },
+            )
+        self.secrets.exclude(key_id__in=seen).delete()
+
+
+# Signing-secret key IDs appear verbatim in the X-Hook-Signatures header, so restrict them to a
+# character set which keeps the "key_id=hexdigest" header format unambiguous.
+WEBHOOK_KEY_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def validate_signing_secrets(webhook, secrets):
+    """
+    Validate a desired set of signing secrets for a webhook.
+
+    :param webhook: The Webhook instance (may be unsaved for new objects, in which case no
+        persisted secrets exist yet).
+    :param secrets: A list of dicts, each with keys key_id, secret, status, is_primary.
+    :raises ValidationError: keyed under 'secrets', listing every problem found.
+
+    Enforced invariants:
+      * key_id is required, unique within the webhook, and limited to [A-Za-z0-9_-].
+      * secret is required for every key.
+      * When any secrets exist, exactly one is marked primary, and it must be enabled.
+      * A retired secret is terminal: it may be left as-is or deleted, but not re-enabled or
+        modified.
+    """
+    errors = []
+
+    existing = {}
+    if webhook.pk:
+        existing = {s.key_id: s for s in WebhookSecret.objects.filter(webhook=webhook)}
+
+    seen = set()
+    primary_count = 0
+    for index, data in enumerate(secrets, start=1):
+        key_id = (data.get('key_id') or '').strip()
+        secret = (data.get('secret') or '').strip()
+        status = data.get('status') or WebhookSecretStatusChoices.STATUS_ENABLED
+        is_primary = bool(data.get('is_primary'))
+
+        label = key_id or _('#{index}').format(index=index)
+
+        if not key_id:
+            errors.append(_('A key ID is required for each signing secret.'))
+        elif not WEBHOOK_KEY_ID_RE.match(key_id):
+            errors.append(_(
+                "Signing secret key ID '{key_id}' is invalid: only letters, numbers, hyphens, "
+                "and underscores are allowed."
+            ).format(key_id=key_id))
+        elif key_id in seen:
+            errors.append(_("Duplicate signing secret key ID '{key_id}'.").format(key_id=key_id))
+        seen.add(key_id)
+
+        if not secret:
+            errors.append(_("Signing secret '{key_id}' requires a secret value.").format(key_id=label))
+        elif len(secret) > 255:
+            errors.append(_("Signing secret '{key_id}' must be at most 255 characters.").format(key_id=label))
+
+        if status not in WebhookSecretStatusChoices.values():
+            errors.append(_("Signing secret '{key_id}' has an invalid status.").format(key_id=label))
+
+        if is_primary:
+            primary_count += 1
+            if status == WebhookSecretStatusChoices.STATUS_RETIRED:
+                errors.append(_(
+                    "Signing secret '{key_id}' cannot be retired while it is the primary key: "
+                    "designate another secret as primary first."
+                ).format(key_id=label))
+            elif status != WebhookSecretStatusChoices.STATUS_ENABLED:
+                errors.append(_("The primary signing secret ('{key_id}') must be enabled.").format(key_id=label))
+
+        # A retired secret is terminal: it may be left unchanged or deleted, but never modified.
+        persisted = existing.get(key_id)
+        if persisted is not None and persisted.status == WebhookSecretStatusChoices.STATUS_RETIRED:
+            if status != WebhookSecretStatusChoices.STATUS_RETIRED:
+                errors.append(_(
+                    "Signing secret '{key_id}' is retired and cannot be re-enabled: delete it or "
+                    "leave it retired."
+                ).format(key_id=key_id))
+            elif secret and secret != persisted.secret:
+                errors.append(_(
+                    "Signing secret '{key_id}' is retired and its secret value cannot be modified."
+                ).format(key_id=key_id))
+
+    if secrets and primary_count == 0:
+        errors.append(_('A primary signing secret is required when any signing secrets are defined.'))
+    elif primary_count > 1:
+        errors.append(_('Only one signing secret may be marked as primary.'))
+
+    if errors:
+        raise ValidationError({'secrets': errors})
+
+
+class WebhookSecret(models.Model):
+    """
+    A signing secret for a Webhook. Each webhook may hold multiple secrets identified by a stable
+    key_id to support key rotation with an overlap period during which receivers accept both old
+    and new keys. Exactly one enabled secret is designated primary.
+
+    Secrets are not change-logged (to avoid recording key material in change history) and are
+    managed through their parent webhook (UI form / REST API), not as standalone objects.
+    """
+    webhook = models.ForeignKey(
+        to=Webhook,
+        on_delete=models.CASCADE,
+        related_name='secrets',
+        verbose_name=_('webhook'),
+    )
+    key_id = models.CharField(
+        max_length=100,
+        verbose_name=_('key ID'),
+        help_text=_(
+            "A stable identifier for this secret, included in the <code>X-Hook-Signatures</code> "
+            "request header so receivers can select the matching key. May contain only letters, "
+            "numbers, hyphens, and underscores."
+        ),
+    )
+    secret = models.CharField(
+        max_length=255,
+        verbose_name=_('secret'),
+        help_text=_(
+            "When provided, the request will include an HMAC hex digest of the payload body "
+            "computed with this secret as the key. The secret itself is not transmitted in the "
+            "request."
+        ),
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=WebhookSecretStatusChoices,
+        default=WebhookSecretStatusChoices.STATUS_ENABLED,
+        verbose_name=_('status'),
+        help_text=_(
+            "Enabled secrets sign outgoing requests. Disabled secrets are retained but do not "
+            "sign. Retired secrets are permanently out of service and no longer sign new events."
+        ),
+    )
+    is_primary = models.BooleanField(
+        default=False,
+        verbose_name=_('primary'),
+        help_text=_(
+            "The primary secret signs the legacy <code>X-Hook-Signature</code> header. Exactly one "
+            "enabled secret must be marked primary."
+        ),
+    )
+
+    class Meta:
+        ordering = ('key_id',)
+        constraints = (
+            models.UniqueConstraint(
+                fields=('webhook', 'key_id'),
+                name='extras_webhooksecret_unique_webhook_key_id',
+            ),
+            models.UniqueConstraint(
+                fields=('webhook',),
+                condition=models.Q(is_primary=True),
+                name='extras_webhooksecret_one_primary_per_webhook',
+            ),
+        )
+        verbose_name = _('webhook signing secret')
+        verbose_name_plural = _('webhook signing secrets')
+
+    def __str__(self):
+        return f'{self.webhook.name}/{self.key_id}'
+
+    def clean(self):
+        super().clean()
+
+        errors = {}
+        if not self.key_id:
+            errors['key_id'] = _('A key ID is required.')
+        elif not WEBHOOK_KEY_ID_RE.match(self.key_id):
+            errors['key_id'] = _('Only letters, numbers, hyphens, and underscores are allowed.')
+        if not self.secret:
+            errors['secret'] = _('A secret value is required.')
+        if self.is_primary and self.status != WebhookSecretStatusChoices.STATUS_ENABLED:
+            errors['is_primary'] = _('The primary signing secret must be enabled.')
+        if errors:
+            raise ValidationError(errors)
 
 
 class CustomLink(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedModel):

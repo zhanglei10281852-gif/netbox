@@ -510,7 +510,7 @@ class WebhookTable(NetBoxTable):
     class Meta(NetBoxTable.Meta):
         model = Webhook
         fields = (
-            'pk', 'id', 'name', 'http_method', 'payload_url', 'http_content_type', 'secret', 'ssl_verification',
+            'pk', 'id', 'name', 'http_method', 'payload_url', 'http_content_type', 'ssl_verification',
             'ca_file_path', 'timeout', 'description', 'tags', 'created', 'last_updated',
         )
         default_columns = (

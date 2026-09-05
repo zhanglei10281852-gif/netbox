@@ -12,7 +12,7 @@ from dcim.choices import SiteStatusChoices
 from dcim.models import Region, Site
 from extras import signals
 from extras.choices import CustomFieldTypeChoices, EventRuleActionChoices
-from extras.models import CustomField, EventRule, Notification, Subscription, Tag, Webhook
+from extras.models import CustomField, EventRule, Notification, Subscription, Tag, Webhook, WebhookSecret
 from extras.validators import CustomValidator
 from netbox.context_managers import event_tracking
 from users.models import User
@@ -175,8 +175,8 @@ class JobEventRulesSignalTestCase(TestCase):
         webhook = Webhook.objects.create(
             name='Webhook',
             payload_url='http://localhost/',
-            secret='secret',
         )
+        WebhookSecret.objects.create(webhook=webhook, key_id='default', secret='secret', is_primary=True)
         webhook_type = ObjectType.objects.get_for_model(Webhook)
         cls.start_rule = EventRule.objects.create(
             name='Job Start Rule',

@@ -7,6 +7,7 @@ from django.utils.translation import gettext_lazy as _
 
 from core.models import DataFile, DataSource, ObjectType
 from extras.choices import *
+from extras.constants import WEBHOOK_DEFAULT_KEY_ID
 from extras.models import *
 from netbox.event_rules import get_event_rule_action
 from netbox.events import get_event_type_choices
@@ -250,13 +251,33 @@ class SavedFilterImportForm(OwnerCSVMixin, CSVModelForm):
 
 
 class WebhookImportForm(OwnerCSVMixin, NetBoxModelImportForm):
+    # Legacy column: a single secret value is imported as the primary signing secret under the
+    # default key ID, so existing CSV imports behave as before multi-secret support.
+    secret = forms.CharField(
+        label=_('Secret'),
+        required=False,
+        help_text=_('Creates an enabled primary signing secret (key ID "default") for the webhook.')
+    )
 
     class Meta:
         model = Webhook
         fields = (
             'name', 'payload_url', 'http_method', 'http_content_type', 'additional_headers', 'body_template',
-            'secret', 'ssl_verification', 'ca_file_path', 'timeout', 'description', 'owner', 'tags'
+            'ssl_verification', 'ca_file_path', 'timeout', 'description', 'owner', 'tags',
         )
+
+    def save(self, commit=True):
+        instance = super().save(commit=commit)
+
+        if commit and self.cleaned_data.get('secret'):
+            instance.sync_secrets([{
+                'key_id': WEBHOOK_DEFAULT_KEY_ID,
+                'secret': self.cleaned_data['secret'],
+                'status': WebhookSecretStatusChoices.STATUS_ENABLED,
+                'is_primary': True,
+            }])
+
+        return instance
 
 
 class EventRuleImportForm(OwnerCSVMixin, NetBoxModelImportForm):

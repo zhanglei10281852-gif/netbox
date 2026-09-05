@@ -48,6 +48,9 @@ class WebhookTestCase(APIViewTestCases.APIViewTestCase):
             'name': 'Webhook 4',
             'payload_url': 'http://example.com/?4',
             'timeout': 15,
+            'secrets': [
+                {'key_id': 'default', 'secret': 'secretstring', 'is_primary': True},
+            ],
         },
         {
             'name': 'Webhook 5',
@@ -81,6 +84,146 @@ class WebhookTestCase(APIViewTestCases.APIViewTestCase):
             ),
         )
         Webhook.objects.bulk_create(webhooks)
+
+    def test_secrets_serialization(self):
+        """The nested `secrets` field replaces the legacy `secret` field."""
+        webhook = Webhook.objects.create(name='Webhook Serialize', payload_url='http://example.com/')
+        WebhookSecret.objects.create(webhook=webhook, key_id='primary', secret='PRIM', is_primary=True)
+        WebhookSecret.objects.create(webhook=webhook, key_id='old', secret='OLD', status='retired')
+        self.add_permissions('extras.view_webhook')
+        url = reverse('extras-api:webhook-detail', kwargs={'pk': webhook.pk})
+        response = self.client.get(url, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertNotIn('secret', response.data)
+        secrets = {s['key_id']: s for s in response.data['secrets']}
+        self.assertEqual(set(secrets), {'primary', 'old'})
+        self.assertTrue(secrets['primary']['is_primary'])
+        self.assertEqual(secrets['primary']['secret'], 'PRIM')
+        self.assertEqual(secrets['old']['status']['value'], 'retired')
+
+    def test_create_with_multiple_secrets(self):
+        self.add_permissions('extras.add_webhook')
+        url = reverse('extras-api:webhook-list')
+        data = {
+            'name': 'Webhook Multi',
+            'payload_url': 'http://example.com/',
+            'secrets': [
+                {'key_id': 'old', 'secret': 'OLD', 'is_primary': True},
+                {'key_id': 'new', 'secret': 'NEW', 'is_primary': False},
+            ],
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        webhook = Webhook.objects.get(pk=response.data['id'])
+        self.assertEqual(
+            set(webhook.secrets.values_list('key_id', flat=True)),
+            {'old', 'new'},
+        )
+        self.assertEqual(webhook.secrets.get(is_primary=True).key_id, 'old')
+
+    def test_create_without_primary_rejected(self):
+        """No primary key: the request must fail and no webhook (nor key rows) be created."""
+        self.add_permissions('extras.add_webhook')
+        url = reverse('extras-api:webhook-list')
+        data = {
+            'name': 'Webhook No Primary',
+            'payload_url': 'http://example.com/',
+            'secrets': [
+                {'key_id': 'one', 'secret': 'A', 'is_primary': False},
+                {'key_id': 'two', 'secret': 'B', 'is_primary': False},
+            ],
+        }
+        with disable_warnings('django.request'):
+            response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('secrets', response.data)
+        self.assertFalse(Webhook.objects.filter(name='Webhook No Primary').exists())
+
+    def test_create_with_duplicate_key_id_rejected(self):
+        self.add_permissions('extras.add_webhook')
+        url = reverse('extras-api:webhook-list')
+        data = {
+            'name': 'Webhook Dup IDs',
+            'payload_url': 'http://example.com/',
+            'secrets': [
+                {'key_id': 'same', 'secret': 'A', 'is_primary': True},
+                {'key_id': 'same', 'secret': 'B', 'is_primary': False},
+            ],
+        }
+        with disable_warnings('django.request'):
+            response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Webhook.objects.filter(name='Webhook Dup IDs').exists())
+
+    def test_retire_primary_rejected(self):
+        """Retiring the current primary without promoting another key must fail atomically."""
+        webhook = Webhook.objects.create(name='Webhook Retire', payload_url='http://example.com/')
+        WebhookSecret.objects.create(webhook=webhook, key_id='old', secret='OLD', is_primary=True)
+        self.add_permissions('extras.change_webhook')
+        url = reverse('extras-api:webhook-detail', kwargs={'pk': webhook.pk})
+        data = {
+            'secrets': [
+                {'key_id': 'old', 'secret': 'OLD', 'status': 'retired', 'is_primary': False},
+            ],
+        }
+        with disable_warnings('django.request'):
+            response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        # No partial update: the old key is still enabled and primary.
+        webhook.refresh_from_db()
+        old = webhook.secrets.get(key_id='old')
+        self.assertEqual(old.status, 'enabled')
+        self.assertTrue(old.is_primary)
+
+    def test_rotate_secrets(self):
+        """
+        End-to-end rotation via the API: add a new enabled key, promote it to primary, then
+        retire the old key.
+        """
+        webhook = Webhook.objects.create(name='Webhook Rotate', payload_url='http://example.com/')
+        WebhookSecret.objects.create(webhook=webhook, key_id='old', secret='OLD', is_primary=True)
+        self.add_permissions('extras.change_webhook')
+        url = reverse('extras-api:webhook-detail', kwargs={'pk': webhook.pk})
+
+        # Overlap: both keys enabled, old key still primary.
+        with disable_warnings('django.request'):
+            response = self.client.patch(url, {
+                'secrets': [
+                    {'key_id': 'old', 'secret': 'OLD', 'status': 'enabled', 'is_primary': True},
+                    {'key_id': 'new', 'secret': 'NEW', 'status': 'enabled', 'is_primary': False},
+                ],
+            }, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(webhook.secrets.filter(status='enabled').count(), 2)
+
+        # Switch primary and retire the old key in one atomic update.
+        with disable_warnings('django.request'):
+            response = self.client.patch(url, {
+                'secrets': [
+                    {'key_id': 'new', 'secret': 'NEW', 'status': 'enabled', 'is_primary': True},
+                    {'key_id': 'old', 'secret': 'OLD', 'status': 'retired', 'is_primary': False},
+                ],
+            }, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        webhook.refresh_from_db()
+        self.assertEqual(webhook.secrets.get(is_primary=True).key_id, 'new')
+        old = webhook.secrets.get(key_id='old')
+        self.assertEqual(old.status, 'retired')
+        # Retired keys no longer sign newly enqueued events.
+        self.assertEqual(
+            {key['key_id'] for key in webhook.get_signing_keys_snapshot()},
+            {'new'},
+        )
+
+    def test_partial_update_without_secrets_leaves_keys_unchanged(self):
+        webhook = Webhook.objects.create(name='Webhook Partial', payload_url='http://example.com/')
+        WebhookSecret.objects.create(webhook=webhook, key_id='default', secret='SECRET', is_primary=True)
+        self.add_permissions('extras.change_webhook')
+        url = reverse('extras-api:webhook-detail', kwargs={'pk': webhook.pk})
+        response = self.client.patch(url, {'description': 'Changed'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(webhook.secrets.count(), 1)
+        self.assertEqual(webhook.secrets.get().secret, 'SECRET')
 
 
 class EventRuleTestCase(APIViewTestCases.APIViewTestCase):

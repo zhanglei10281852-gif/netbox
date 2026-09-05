@@ -37,6 +37,11 @@ SCRIPT_MODULE_NAME_PREFIX = '_netbox_script_module_'
 # Webhooks
 HTTP_CONTENT_TYPE_JSON = 'application/json'
 
+# Stable key_id assigned to the single key migrated from the legacy Webhook.secret field (and
+# created when a secret is supplied via CSV import), so upgraded webhooks keep their original
+# primary signature.
+WEBHOOK_DEFAULT_KEY_ID = 'default'
+
 WEBHOOK_EVENT_TYPES = {
     # Map registered event types to public webhook "event" equivalents
     OBJECT_CREATED: 'created',

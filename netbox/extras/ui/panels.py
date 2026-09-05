@@ -2,6 +2,7 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.utils.translation import gettext_lazy as _
 
+from extras.choices import WebhookSecretStatusChoices
 from netbox.ui import actions, attrs, panels
 from utilities.data import resolve_attr_path
 
@@ -44,6 +45,7 @@ __all__ = (
     'WebhookHTTPPanel',
     'WebhookPanel',
     'WebhookSSLPanel',
+    'WebhookSecretsPanel',
 )
 
 
@@ -352,8 +354,32 @@ class WebhookHTTPPanel(panels.ObjectAttributesPanel):
     http_method = attrs.ChoiceAttr('http_method', label=_('HTTP method'))
     payload_url = attrs.TextAttr('payload_url', label=_('Payload URL'), style='font-monospace')
     http_content_type = attrs.TextAttr('http_content_type', label=_('HTTP content type'))
-    secret = attrs.TextAttr('secret')
     timeout = WebhookTimeoutAttr('timeout')
+
+
+class WebhookSecretsPanel(panels.ObjectPanel):
+    """
+    Renders the webhook's signing secrets, including key ID, status, and primary designation.
+    """
+    title = _('Signing Secrets')
+    template_name = 'extras/panels/webhook_secrets.html'
+
+    def get_context(self, context):
+        status_colors = {choice.value: choice.color for choice in WebhookSecretStatusChoices.CHOICES}
+        secrets = [
+            {
+                'key_id': secret.key_id,
+                'secret': secret.secret,
+                'is_primary': secret.is_primary,
+                'status_label': secret.get_status_display(),
+                'status_color': status_colors.get(secret.status),
+            }
+            for secret in context['object'].secrets.all()
+        ]
+        return {
+            **super().get_context(context),
+            'secrets': secrets,
+        }
 
 
 class WebhookSSLPanel(panels.ObjectAttributesPanel):

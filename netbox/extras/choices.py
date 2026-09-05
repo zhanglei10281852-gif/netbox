@@ -262,6 +262,26 @@ class WebhookHttpMethodChoices(ChoiceSet):
     )
 
 
+class WebhookSecretStatusChoices(ChoiceSet):
+    """
+    Status of a webhook signing secret.
+
+    enabled: The secret signs newly enqueued events.
+    disabled: The secret is retained but temporarily does not sign events; it can be enabled again.
+    retired: The secret is permanently out of service. It never signs new events and cannot be
+             modified (only deleted), so that receivers can finish their key rotation.
+    """
+    STATUS_ENABLED = 'enabled'
+    STATUS_DISABLED = 'disabled'
+    STATUS_RETIRED = 'retired'
+
+    CHOICES = (
+        Choice(STATUS_ENABLED, _('Enabled'), color='green'),
+        Choice(STATUS_DISABLED, _('Disabled'), color='gray'),
+        Choice(STATUS_RETIRED, _('Retired'), color='red'),
+    )
+
+
 #
 # Dashboard widgets
 #

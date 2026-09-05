@@ -271,10 +271,6 @@ class WebhookBulkEditForm(OwnerMixin, NetBoxModelBulkEditForm):
         widget=BulkEditNullBooleanSelect(),
         label=_('SSL verification')
     )
-    secret = forms.CharField(
-        label=_('Secret'),
-        required=False
-    )
     ca_file_path = forms.CharField(
         required=False,
         label=_('CA file path')
@@ -286,7 +282,7 @@ class WebhookBulkEditForm(OwnerMixin, NetBoxModelBulkEditForm):
         label=_('Timeout')
     )
 
-    nullable_fields = ('secret', 'ca_file_path', 'timeout')
+    nullable_fields = ('ca_file_path', 'timeout')
 
 
 class EventRuleBulkEditForm(OwnerMixin, NetBoxModelBulkEditForm):

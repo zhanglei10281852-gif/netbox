@@ -396,7 +396,6 @@ class WebhookFilter(CustomFieldsFilterMixin, TagsFilterMixin, ChangeLoggedModelF
     http_content_type: StrFilterLookup | None = strawberry_django.filter_field()
     additional_headers: StrFilterLookup | None = strawberry_django.filter_field()
     body_template: StrFilterLookup | None = strawberry_django.filter_field()
-    secret: StrFilterLookup | None = strawberry_django.filter_field()
     ssl_verification: FilterLookup[bool] | None = strawberry_django.filter_field()
     ca_file_path: StrFilterLookup | None = strawberry_django.filter_field()
     timeout: FilterLookup[int] | None = strawberry_django.filter_field()

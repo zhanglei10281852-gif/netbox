@@ -100,6 +100,30 @@ Using [Event Rules](../features/event-rules.md), when a change is detected, any 
 
 A request is considered successful if the response has a 2XX status code; otherwise, the request is marked as having failed. Failed requests may be requeued manually under System > Background Tasks.
 
+## Request Signing & Key Rotation
+
+When a webhook has at least one enabled signing secret, each request carries two headers, both computed as an HMAC (SHA-512) hex digest of the *final* request body using the secret as the key:
+
+* `X-Hook-Signature` — the signature produced by the webhook's **primary** secret. Receivers written for earlier NetBox releases verify this header exactly as before.
+* `X-Hook-Signatures` — a comma-separated list of `<key_id>=<signature>` entries, one entry per enabled secret, e.g.:
+
+```
+X-Hook-Signatures: primary=9f86d081...,rotated-2026=e3b0c442...
+```
+
+The receiver parses the entries, looks up the matching key by `key_id`, and compares the expected HMAC (e.g. with `hmac.compare_digest`) against the signature. Accepting any valid entry allows overlapping keys to coexist during rotation.
+
+Key IDs are stable identifiers containing only letters, numbers, hyphens, and underscores, and are managed on the webhook (in the UI editor or the REST API `secrets` field). Secrets may be **enabled** (sign new events), **disabled** (retained without signing; can be re-enabled), or **retired** (terminal; never signs new events and cannot be modified, only deleted). Exactly one enabled secret must be marked primary.
+
+To rotate the signing key without rejecting valid events:
+
+1. Add the new secret as *enabled* (not yet primary).
+2. Deploy the new key to the receiver and configure it to accept signatures from `X-Hook-Signatures` for either key ID.
+3. Mark the new secret *primary*. `X-Hook-Signature` then reflects the new key, while `X-Hook-Signatures` still carries both during the overlap.
+4. Once the receiver no longer needs the old key, **retire** (or delete) it.
+
+The set of keys used for an event is snapshotted when the event is enqueued and travels with the background job, so changing secrets while events are queued — or an automatic job retry — never changes which signatures a given event carries. Events enqueued after a key is retired or disabled simply do not include that key's signature. Webhooks without any secrets are sent without signature headers.
+
 ## Troubleshooting
 
 To assist with verifying that the content of outgoing webhooks is rendered correctly, NetBox provides a simple HTTP listener that can be run locally to receive and display webhook requests. First, modify the target URL of the desired webhook to `http://localhost:9000/`. This will instruct NetBox to send the request to the local server on TCP port 9000. Then, start the webhook receiver service from the NetBox root directory:

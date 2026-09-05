@@ -68,9 +68,23 @@ Any additional header to include with the outgoing HTTP request. These should be
 
 Jinja2 template for a custom request body, if desired. If not defined, NetBox will populate the request body with a raw dump of the webhook context.
 
-### Secret
+### Signing Secrets
 
-A secret string used to prove authenticity of the request (optional). This will append a `X-Hook-Signature` header to the request, consisting of a HMAC (SHA-512) hex digest of the request body using the secret as the key.
+Webhooks may define one or more signing secrets used to prove the authenticity of each request. Each secret has:
+
+* A stable **key ID** containing only letters, numbers, hyphens, and underscores (e.g. `primary`, `2026-rotated`), which is sent with the request so the receiver can select the matching key.
+* The **secret value** itself, an HMAC key which is never transmitted in the request.
+* A **status**: *enabled* (signs outgoing requests), *disabled* (retained but not signing; can be re-enabled), or *retired* (permanently out of service; no longer signs new events and cannot be modified, only deleted).
+* A **primary** designation: exactly one enabled secret must be marked primary.
+
+When at least one enabled secret exists, requests carry two headers, both computed as a HMAC (SHA-512) hex digest of the final request body:
+
+* `X-Hook-Signature` — the signature of the **primary** secret. This header is unchanged from earlier NetBox releases, so existing receivers keep working.
+* `X-Hook-Signatures` — a comma-separated list of `key_id=signature` entries, one per **enabled** secret, allowing receivers to verify against any current key.
+
+To rotate a key without interrupting verification: add the new secret as *enabled* (non-primary), deploy it to the receiver, mark the new secret **primary** once receivers accept it, then **retire** the old secret. Retired and disabled secrets are omitted from events enqueued after the change. The set of keys used for an event is fixed when the event is enqueued, so in-flight events and retried jobs are always signed with exactly the keys that were active at enqueue time.
+
+Webhooks without any secrets continue to be sent without signature headers.
 
 ### Conditions
 

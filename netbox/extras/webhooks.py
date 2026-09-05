@@ -22,6 +22,12 @@ __all__ = (
 
 logger = logging.getLogger('netbox.webhooks')
 
+# Header carrying the signature of the primary signing key (backward compatible).
+SIGNATURE_HEADER = 'X-Hook-Signature'
+# Header carrying one signature per enabled key, keyed by the key's stable identifier,
+# as comma-separated "<key_id>=<hexdigest>" entries.
+SIGNATURES_HEADER = 'X-Hook-Signatures'
+
 
 def register_webhook_callback(func):
     """
@@ -44,8 +50,33 @@ def generate_signature(request_body, secret):
     return hmac_prep.hexdigest()
 
 
+def sign_request(prepared_request, signing_keys):
+    """
+    Attach HMAC signatures of the (final) request body to the prepared request headers.
+
+    :param signing_keys: A list of {'key_id', 'secret', 'is_primary'} dicts, as snapshotted at
+        enqueue time. Each enabled key produces an entry in the X-Hook-Signatures header; the
+        primary key additionally signs the legacy X-Hook-Signature header. When empty, no
+        signature headers are added (the webhook has no signing secrets configured).
+    """
+    if not signing_keys:
+        return
+
+    signatures = {
+        key['key_id']: generate_signature(prepared_request.body, key['secret'])
+        for key in signing_keys
+    }
+    primary_key = next((key for key in signing_keys if key.get('is_primary')), None)
+    if primary_key is not None:
+        prepared_request.headers[SIGNATURE_HEADER] = signatures[primary_key['key_id']]
+    prepared_request.headers[SIGNATURES_HEADER] = ','.join(
+        f'{key_id}={signature}' for key_id, signature in signatures.items()
+    )
+
+
 @job('default')
-def send_webhook(event_rule, object_type, event_type, data, timestamp, request=None, snapshots=None):
+def send_webhook(event_rule, object_type, event_type, data, timestamp, request=None, snapshots=None,
+                signing_keys=None):
     """
     Make a POST request to the defined Webhook
     """
@@ -110,9 +141,13 @@ def send_webhook(event_rule, object_type, event_type, data, timestamp, request=N
         logger.error(f"Error forming HTTP request: {e}")
         raise e
 
-    # If a secret key is defined, sign the request with a hash of the key and its content
-    if webhook.secret != '':
-        prepared_request.headers['X-Hook-Signature'] = generate_signature(prepared_request.body, webhook.secret)
+    # Sign the request using the signing keys snapshotted when the event was enqueued. Jobs
+    # enqueued before multi-secret support (which carry no snapshot) fall back to the webhook's
+    # current signing configuration, matching the legacy behavior of reading the secret at send
+    # time.
+    if signing_keys is None:
+        signing_keys = webhook.get_signing_keys_snapshot()
+    sign_request(prepared_request, signing_keys)
 
     # Determine the request timeout, preferring the webhook-specific value over the global default
     timeout = webhook.timeout if webhook.timeout is not None else settings.WEBHOOK_DEFAULT_TIMEOUT

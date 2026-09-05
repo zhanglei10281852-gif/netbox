@@ -233,7 +233,7 @@ class TagType(OwnerMixin, ObjectType):
 
 @register_type(
     models.Webhook,
-    exclude=['content_types',],
+    exclude=['content_types', 'secrets'],
     filters=WebhookFilter,
     pagination=True
 )

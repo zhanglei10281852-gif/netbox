@@ -23,10 +23,11 @@ from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices, SiteStatusCh
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from extras.choices import EventRuleActionChoices
 from extras.events import enqueue_event, flush_events, process_event_rules, serialize_for_event
-from extras.models import EventRule, Notification, Script, ScriptModule, Tag, Webhook
+from extras.models import EventRule, Notification, Script, ScriptModule, Tag, Webhook, WebhookSecret
+from extras.models.models import validate_signing_secrets
 from extras.scripts import Script as ScriptBase
 from extras.signals import process_job_end_event_rules
-from extras.webhooks import generate_signature, send_webhook
+from extras.webhooks import SIGNATURES_HEADER, generate_signature, send_webhook
 from ipam.choices import IPAddressStatusChoices
 from ipam.models import IPAddress, Prefix
 from netbox.context_managers import event_tracking
@@ -76,9 +77,16 @@ class EventRuleTestCase(RQQueueTestMixin, APITestCase):
         DUMMY_SECRET = 'LOOKATMEIMASECRETSTRING'
 
         webhooks = Webhook.objects.bulk_create((
-            Webhook(name='Webhook 1', payload_url=DUMMY_URL, secret=DUMMY_SECRET, additional_headers='X-Foo: Bar'),
-            Webhook(name='Webhook 2', payload_url=DUMMY_URL, secret=DUMMY_SECRET),
-            Webhook(name='Webhook 3', payload_url=DUMMY_URL, secret=DUMMY_SECRET),
+            Webhook(name='Webhook 1', payload_url=DUMMY_URL, additional_headers='X-Foo: Bar'),
+            Webhook(name='Webhook 2', payload_url=DUMMY_URL),
+            Webhook(name='Webhook 3', payload_url=DUMMY_URL),
+        ))
+        # Each webhook carries a single primary signing secret, equivalent to a webhook migrated
+        # from the legacy single-secret configuration.
+        WebhookSecret.objects.bulk_create((
+            WebhookSecret(webhook=webhooks[0], key_id='default', secret=DUMMY_SECRET, is_primary=True),
+            WebhookSecret(webhook=webhooks[1], key_id='default', secret=DUMMY_SECRET, is_primary=True),
+            WebhookSecret(webhook=webhooks[2], key_id='default', secret=DUMMY_SECRET, is_primary=True),
         ))
 
         webhook_type = ObjectType.objects.get(app_label='extras', model='webhook')
@@ -674,11 +682,17 @@ class EventRuleTestCase(RQQueueTestMixin, APITestCase):
             """
             event = EventRule.objects.get(name='Event Rule 1')
             webhook = event.action_object
-            signature = generate_signature(request.body, webhook.secret)
+            primary_secret = webhook.secrets.get(is_primary=True).secret
+            signature = generate_signature(request.body, primary_secret)
 
-            # Validate the outgoing request headers
+            # Validate the outgoing request headers. The primary key's signature appears in both
+            # the legacy X-Hook-Signature header and the keyed X-Hook-Signatures header.
             self.assertEqual(request.headers['Content-Type'], webhook.http_content_type)
             self.assertEqual(request.headers['X-Hook-Signature'], signature)
+            self.assertEqual(
+                request.headers[SIGNATURES_HEADER],
+                f'default={signature}',
+            )
             self.assertEqual(request.headers['X-Foo'], 'Bar')
 
             # The webhook does not define its own timeout, so the global default should be used
@@ -817,6 +831,157 @@ class EventRuleTestCase(RQQueueTestMixin, APITestCase):
                     send_webhook(**job.kwargs)
 
         self.assertIn(f'timed out after {settings.WEBHOOK_DEFAULT_TIMEOUT} seconds', cm.output[0])
+
+    def _enqueue_webhook_job(self, webhook=None):
+        """
+        Enqueue a created-site event and return the kwargs of the resulting send_webhook job.
+        If `webhook` is given, the enqueued job for that webhook is returned; otherwise the only
+        job in the queue.
+        """
+        request = RequestFactory().get(reverse('dcim:site_add'))
+        request.id = uuid.uuid4()
+        request.user = self.user
+
+        webhooks_queue = {}
+        site = Site.objects.create(name='Site 1', slug='site-1')
+        enqueue_event(webhooks_queue, instance=site, request=request, event_type=OBJECT_CREATED)
+        flush_events(list(webhooks_queue.values()))
+
+        jobs = self.queue.jobs
+        if webhook is not None:
+            jobs = [job for job in jobs if job.kwargs['event_rule'].action_object == webhook]
+        return jobs[0].kwargs
+
+    def test_enqueue_snapshots_signing_keys(self):
+        """
+        Enqueuing a webhook job freezes the enabled signing keys (key_id, secret, primary flag)
+        into the job parameters; disabled and retired keys are excluded.
+        """
+        webhook = Webhook.objects.get(name='Webhook 1')
+        WebhookSecret.objects.create(webhook=webhook, key_id='rotated', secret='NEWSECRET', is_primary=False)
+        WebhookSecret.objects.create(
+            webhook=webhook, key_id='staged', secret='STAGED', status='disabled', is_primary=False
+        )
+
+        job_kwargs = self._enqueue_webhook_job(webhook)
+
+        self.assertEqual(
+            {key['key_id'] for key in job_kwargs['signing_keys']},
+            {'default', 'rotated'},
+        )
+        default_key = next(key for key in job_kwargs['signing_keys'] if key['key_id'] == 'default')
+        rotated_key = next(key for key in job_kwargs['signing_keys'] if key['key_id'] == 'rotated')
+        self.assertTrue(default_key['is_primary'])
+        self.assertFalse(rotated_key['is_primary'])
+        self.assertEqual(default_key['secret'], 'LOOKATMEIMASECRETSTRING')
+        self.assertEqual(rotated_key['secret'], 'NEWSECRET')
+
+    def test_send_webhook_multiple_signing_secrets(self):
+        """
+        With multiple enabled keys, every key signs the final request body and appears in the
+        X-Hook-Signatures header, while X-Hook-Signature carries the primary key's signature.
+        """
+        webhook = Webhook.objects.get(name='Webhook 1')
+        WebhookSecret.objects.create(webhook=webhook, key_id='rotated', secret='NEWSECRET', is_primary=False)
+
+        def dummy_send(_, request, **kwargs):
+            entries = dict(
+                entry.split('=', 1) for entry in request.headers[SIGNATURES_HEADER].split(',')
+            )
+            # Both enabled keys sign the (final) request body, each with its own secret.
+            self.assertEqual(set(entries), {'default', 'rotated'})
+            self.assertEqual(entries['default'], generate_signature(request.body, 'LOOKATMEIMASECRETSTRING'))
+            self.assertEqual(entries['rotated'], generate_signature(request.body, 'NEWSECRET'))
+            # The legacy header continues to carry the primary key's signature.
+            self.assertEqual(request.headers['X-Hook-Signature'], entries['default'])
+            return HttpResponse()
+
+        job_kwargs = self._enqueue_webhook_job(webhook)
+        with patch.object(Session, 'send', dummy_send):
+            send_webhook(**job_kwargs)
+
+    def test_send_webhook_unsigned_when_no_secrets(self):
+        """
+        A webhook without signing secrets sends no signature headers at all.
+        """
+        unsigned = Webhook.objects.create(name='Webhook Unsigned', payload_url='http://localhost:9000/')
+        webhook_type = ObjectType.objects.get_for_model(Webhook)
+        event_rule = EventRule.objects.create(
+            name='Event Rule Unsigned',
+            event_types=[OBJECT_CREATED],
+            action_type=EventRuleActionChoices.WEBHOOK,
+            action_object_type=webhook_type,
+            action_object_id=unsigned.pk,
+        )
+        event_rule.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        def dummy_send(_, request, **kwargs):
+            self.assertNotIn('X-Hook-Signature', request.headers)
+            self.assertNotIn(SIGNATURES_HEADER, request.headers)
+            return HttpResponse()
+
+        job_kwargs = self._enqueue_webhook_job(unsigned)
+        with patch.object(Session, 'send', dummy_send):
+            send_webhook(**job_kwargs)
+
+    def test_signing_identity_frozen_at_enqueue(self):
+        """
+        The signing keys are snapshotted at enqueue time. Retiring a key (or adding a new one)
+        after the event is queued must not alter the signatures the job sends, and automatic
+        retries reuse the same snapshot.
+        """
+        webhook = Webhook.objects.get(name='Webhook 1')
+        WebhookSecret.objects.create(webhook=webhook, key_id='rotated', secret='NEWSECRET', is_primary=False)
+
+        job_kwargs = self._enqueue_webhook_job(webhook)
+        snapshot_ids = {key['key_id'] for key in job_kwargs['signing_keys']}
+        self.assertEqual(snapshot_ids, {'default', 'rotated'})
+
+        # Rotate after enqueue: retire the old primary, promote the new key, add a third key.
+        webhook.sync_secrets([
+            {'key_id': 'rotated', 'secret': 'NEWSECRET', 'status': 'enabled', 'is_primary': True},
+            {'key_id': 'added-later', 'secret': 'LATERSECRET', 'status': 'enabled', 'is_primary': False},
+            {'key_id': 'default', 'secret': 'LOOKATMEIMASECRETSTRING', 'status': 'retired', 'is_primary': False},
+        ])
+
+        # The queued job's snapshot is unchanged by the configuration change.
+        self.assertEqual({key['key_id'] for key in job_kwargs['signing_keys']}, {'default', 'rotated'})
+
+        def dummy_send(_, request, **kwargs):
+            entries = dict(
+                entry.split('=', 1) for entry in request.headers[SIGNATURES_HEADER].split(',')
+            )
+            # Retired-at-send-time key still signs (it was enabled at enqueue); the key added
+            # after enqueue does not.
+            self.assertEqual(set(entries), {'default', 'rotated'})
+            self.assertEqual(entries['default'], generate_signature(request.body, 'LOOKATMEIMASECRETSTRING'))
+            self.assertEqual(entries['rotated'], generate_signature(request.body, 'NEWSECRET'))
+            self.assertNotIn('added-later', entries)
+            # Legacy header reflects the snapshot's primary (the old key), not the new config.
+            self.assertEqual(request.headers['X-Hook-Signature'], entries['default'])
+            return HttpResponse()
+
+        with patch.object(Session, 'send', dummy_send):
+            send_webhook(**job_kwargs)
+
+    def test_legacy_job_without_snapshot_uses_live_config(self):
+        """
+        A job enqueued before multi-secret support carries no signing_keys snapshot. The send
+        falls back to the webhook's current keys (matching the legacy live-read behavior).
+        """
+        webhook = Webhook.objects.get(name='Webhook 1')
+
+        def dummy_send(_, request, **kwargs):
+            self.assertEqual(
+                request.headers['X-Hook-Signature'],
+                generate_signature(request.body, 'LOOKATMEIMASECRETSTRING'),
+            )
+            return HttpResponse()
+
+        job_kwargs = self._enqueue_webhook_job(webhook)
+        job_kwargs['signing_keys'] = None  # Simulate a pre-upgrade job
+        with patch.object(Session, 'send', dummy_send):
+            send_webhook(**job_kwargs)
 
     def test_job_completed_webhook_without_request(self):
         """
@@ -1904,6 +2069,132 @@ class EventRuleNoObjectActionTestCase(TestCase):
         self.assertIsNone(rule.action_object_type)
         self.assertIsNone(rule.action_object_id)
         self.assertIsNone(rule.action_object)
+
+
+class WebhookSecretValidationTestCase(TestCase):
+    """
+    Tests for the shared signing-secret validation used by both the UI form and the REST API.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.webhook = Webhook.objects.create(name='Webhook', payload_url='http://example.com/')
+
+    def assertInvalid(self, keys):
+        with self.assertRaises(ValidationError) as cm:
+            validate_signing_secrets(self.webhook, keys)
+        return cm.exception
+
+    def assertValid(self, keys):
+        validate_signing_secrets(self.webhook, keys)
+
+    def test_empty_set_is_valid(self):
+        """A webhook without secrets remains unsigned, which is a valid state."""
+        self.assertValid([])
+
+    def test_single_primary_enabled_is_valid(self):
+        self.assertValid([
+            {'key_id': 'primary', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
+        ])
+
+    def test_two_enabled_keys_with_primary_is_valid(self):
+        self.assertValid([
+            {'key_id': 'old', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
+            {'key_id': 'new', 'secret': 'b', 'status': 'enabled', 'is_primary': False},
+        ])
+
+    def test_missing_primary_rejected(self):
+        self.assertInvalid([
+            {'key_id': 'old', 'secret': 'a', 'status': 'enabled', 'is_primary': False},
+            {'key_id': 'new', 'secret': 'b', 'status': 'enabled', 'is_primary': False},
+        ])
+
+    def test_multiple_primaries_rejected(self):
+        self.assertInvalid([
+            {'key_id': 'old', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
+            {'key_id': 'new', 'secret': 'b', 'status': 'enabled', 'is_primary': True},
+        ])
+
+    def test_disabled_primary_rejected(self):
+        self.assertInvalid([
+            {'key_id': 'old', 'secret': 'a', 'status': 'disabled', 'is_primary': True},
+            {'key_id': 'new', 'secret': 'b', 'status': 'enabled', 'is_primary': False},
+        ])
+
+    def test_duplicate_key_ids_rejected(self):
+        self.assertInvalid([
+            {'key_id': 'same', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
+            {'key_id': 'same', 'secret': 'b', 'status': 'enabled', 'is_primary': False},
+        ])
+
+    def test_blank_key_id_rejected(self):
+        self.assertInvalid([
+            {'key_id': '  ', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
+        ])
+
+    def test_invalid_key_id_characters_rejected(self):
+        self.assertInvalid([
+            {'key_id': 'bad id!', 'secret': 'a', 'status': 'enabled', 'is_primary': True},
+        ])
+
+    def test_blank_secret_rejected(self):
+        self.assertInvalid([
+            {'key_id': 'primary', 'secret': '   ', 'status': 'enabled', 'is_primary': True},
+        ])
+
+    def test_retire_primary_rejected(self):
+        self.assertInvalid([
+            {'key_id': 'old', 'secret': 'a', 'status': 'retired', 'is_primary': True},
+        ])
+
+    def test_retired_key_is_terminal(self):
+        # The existing key has been retired; a current enabled key is primary.
+        WebhookSecret.objects.create(
+            webhook=self.webhook, key_id='current', secret='CUR', status='enabled', is_primary=True
+        )
+        WebhookSecret.objects.create(
+            webhook=self.webhook, key_id='old', secret='OLD', status='retired', is_primary=False
+        )
+
+        # Re-enabling a retired key is rejected.
+        self.assertInvalid([
+            {'key_id': 'current', 'secret': 'CUR', 'status': 'enabled', 'is_primary': True},
+            {'key_id': 'old', 'secret': 'OLD', 'status': 'enabled', 'is_primary': False},
+        ])
+
+        # Changing a retired key's secret is rejected.
+        self.assertInvalid([
+            {'key_id': 'current', 'secret': 'CUR', 'status': 'enabled', 'is_primary': True},
+            {'key_id': 'old', 'secret': 'CHANGED', 'status': 'retired', 'is_primary': False},
+        ])
+
+        # Leaving the retired key as-is (or omitting it to delete it) is valid.
+        self.assertValid([
+            {'key_id': 'current', 'secret': 'CUR', 'status': 'enabled', 'is_primary': True},
+            {'key_id': 'old', 'secret': 'OLD', 'status': 'retired', 'is_primary': False},
+        ])
+        self.assertValid([
+            {'key_id': 'current', 'secret': 'CUR', 'status': 'enabled', 'is_primary': True},
+        ])
+
+    def test_snapshot_contains_enabled_keys_only(self):
+        WebhookSecret.objects.create(
+            webhook=self.webhook, key_id='primary', secret='A', status='enabled', is_primary=True
+        )
+        WebhookSecret.objects.create(
+            webhook=self.webhook, key_id='enabled', secret='B', status='enabled', is_primary=False
+        )
+        WebhookSecret.objects.create(
+            webhook=self.webhook, key_id='disabled', secret='C', status='disabled', is_primary=False
+        )
+        WebhookSecret.objects.create(
+            webhook=self.webhook, key_id='retired', secret='D', status='retired', is_primary=False
+        )
+
+        snapshot = self.webhook.get_signing_keys_snapshot()
+        self.assertEqual({k['key_id'] for k in snapshot}, {'primary', 'enabled'})
+        self.assertEqual(snapshot[0]['key_id'], 'enabled')  # ordered by key_id
+        self.assertTrue(next(k for k in snapshot if k['key_id'] == 'primary')['is_primary'])
 
 
 class WebhookRenderHeadersTest(TestCase):

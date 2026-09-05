@@ -703,6 +703,77 @@ class WebhookTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'timeout': 60,
         }
 
+    def _secrets_form_data(self, rows, primary_index=None):
+        """
+        Build POST data for the signing-secret editor widget for the given list of
+        (key_id, secret, status) rows.
+        """
+        return {
+            'secrets_key_id': [row[0] for row in rows],
+            'secrets_secret': [row[1] for row in rows],
+            'secrets_status': [row[2] for row in rows],
+            'secrets_primary': str(primary_index) if primary_index is not None else '',
+        }
+
+    def test_create_with_signing_secrets(self):
+        data = {
+            'name': 'Webhook Keys',
+            'payload_url': 'http://example.com/',
+            'http_method': 'POST',
+            'http_content_type': 'application/json',
+            **self._secrets_form_data([
+                ('old', 'OLD', 'enabled'),
+                ('new', 'NEW', 'enabled'),
+            ], primary_index=0),
+        }
+        response = self.client.post(reverse('extras:webhook_add'), data)
+        self.assertEqual(response.status_code, 302)
+        webhook = Webhook.objects.get(name='Webhook Keys')
+        self.assertEqual(set(webhook.secrets.values_list('key_id', flat=True)), {'old', 'new'})
+        self.assertEqual(webhook.secrets.get(is_primary=True).key_id, 'old')
+
+    def test_create_without_primary_rejected(self):
+        data = {
+            'name': 'Webhook No Primary',
+            'payload_url': 'http://example.com/',
+            'http_method': 'POST',
+            'http_content_type': 'application/json',
+            **self._secrets_form_data([
+                ('one', 'A', 'enabled'),
+                ('two', 'B', 'enabled'),
+            ], primary_index=None),
+        }
+        response = self.client.post(reverse('extras:webhook_add'), data)
+        # Form re-renders with validation errors; no object is created.
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Webhook.objects.filter(name='Webhook No Primary').exists())
+
+    def test_edit_rotates_and_retires_secret(self):
+        webhook = Webhook.objects.create(name='Webhook Rotate UI', payload_url='http://example.com/')
+        WebhookSecret.objects.create(webhook=webhook, key_id='old', secret='OLD', is_primary=True)
+
+        data = {
+            'name': 'Webhook Rotate UI',
+            'payload_url': 'http://example.com/',
+            'http_method': 'POST',
+            'http_content_type': 'application/json',
+            'ssl_verification': True,
+            **self._secrets_form_data([
+                ('new', 'NEW', 'enabled'),
+                ('old', 'OLD', 'retired'),
+            ], primary_index=0),
+        }
+        response = self.client.post(reverse('extras:webhook_edit', kwargs={'pk': webhook.pk}), data)
+        self.assertEqual(response.status_code, 302)
+        webhook.refresh_from_db()
+        self.assertEqual(webhook.secrets.get(is_primary=True).key_id, 'new')
+        self.assertEqual(webhook.secrets.get(key_id='old').status, 'retired')
+        # Retired keys no longer appear in enqueue snapshots.
+        self.assertEqual(
+            {key['key_id'] for key in webhook.get_signing_keys_snapshot()},
+            {'new'},
+        )
+
 
 class EventRulesTestCase(ViewTestCases.PrimaryObjectViewTestCase):
     model = EventRule

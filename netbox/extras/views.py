@@ -771,6 +771,7 @@ class WebhookView(generic.ObjectView):
         left_panels=[
             panels.WebhookPanel(),
             panels.WebhookHTTPPanel(),
+            panels.WebhookSecretsPanel(),
             panels.WebhookSSLPanel(),
         ],
         right_panels=[

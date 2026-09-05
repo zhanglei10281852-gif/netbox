@@ -570,17 +570,118 @@ class SubscriptionForm(forms.ModelForm):
         fields = ('object_type', 'object_id')
 
 
+class WebhookSecretsWidget(forms.Widget):
+    """
+    Renders the table of signing secrets on the webhook edit form. Each row submits a key_id, a
+    secret value, a status, and a shared primary-key radio; existing rows may be deleted via a
+    checkbox. Fully blank rows are ignored.
+    """
+    template_name = 'extras/widgets/webhook_secrets.html'
+
+    # Number of blank rows offered for new secrets.
+    extra = 3
+
+    def _serialize_row(self, index, data):
+        if isinstance(data, WebhookSecret):
+            row = {
+                'key_id': data.key_id,
+                'secret': data.secret,
+                'status': data.status,
+                'is_primary': data.is_primary,
+            }
+        else:
+            row = {
+                'key_id': data.get('key_id', ''),
+                'secret': data.get('secret', ''),
+                'status': data.get('status', WebhookSecretStatusChoices.STATUS_ENABLED),
+                'is_primary': bool(data.get('is_primary', False)),
+            }
+        status = row['status'] or WebhookSecretStatusChoices.STATUS_ENABLED
+        row.update({
+            'index': index,
+            'status': status,
+            'retired': status == WebhookSecretStatusChoices.STATUS_RETIRED,
+            'status_choices': WebhookSecretStatusChoices.CHOICES,
+        })
+        return row
+
+    def get_context(self, name, value, attrs):
+        context = super().get_context(name, value, attrs)
+        rows = [self._serialize_row(i, item) for i, item in enumerate(value or [])]
+        # Append blank rows for entering new secrets.
+        rows.extend([
+            self._serialize_row(len(rows) + i, {
+                'key_id': '',
+                'secret': '',
+                'status': WebhookSecretStatusChoices.STATUS_ENABLED,
+                'is_primary': False,
+            })
+            for i in range(self.extra)
+        ])
+        for row in rows:
+            row.update({'blank': not row['key_id'] and not row['secret']})
+        context['widget']['rows'] = rows
+        return context
+
+    def value_from_datadict(self, data, files, name):
+        key_ids = data.getlist(f'{name}_key_id')
+        secrets = data.getlist(f'{name}_secret')
+        statuses = data.getlist(f'{name}_status')
+        primary_index = data.get(f'{name}_primary')
+        deleted = set(data.getlist(f'{name}_delete'))
+
+        rows = []
+        for index, (key_id, secret, status) in enumerate(zip(key_ids, secrets, statuses)):
+            key_id = key_id.strip()
+            secret = secret.strip()
+            if not key_id and not secret:
+                # A fully blank template row; ignore it.
+                continue
+            if key_id in deleted:
+                # The row was marked for deletion.
+                continue
+            rows.append({
+                'key_id': key_id,
+                'secret': secret,
+                'status': status or WebhookSecretStatusChoices.STATUS_ENABLED,
+                'is_primary': primary_index is not None and str(index) == primary_index,
+            })
+        return rows
+
+
+class WebhookSecretsField(forms.Field):
+    """
+    Form field carrying the webhook's signing-secret set. Row-level validation (duplicate or
+    empty key IDs, primary designation, etc.) is performed against the full set in
+    WebhookForm.clean(); the field itself only normalizes the widget output.
+    """
+    widget = WebhookSecretsWidget
+    required = False
+
+    def clean(self, value):
+        return value or []
+
+
 class WebhookForm(OwnerMixin, NetBoxModelForm):
     http_method = ChoiceField(
         label=_('HTTP method'),
         choices=WebhookHttpMethodChoices,
         initial=WebhookHttpMethodChoices.METHOD_POST,
     )
+    secrets = WebhookSecretsField(
+        label=_('Signing secrets'),
+        help_text=_(
+            "One or more HMAC secrets used to sign outgoing requests. Exactly one enabled secret "
+            "must be marked primary; it also signs the legacy <code>X-Hook-Signature</code> header. "
+            "Add a new enabled secret to begin a key rotation, mark it primary once receivers accept "
+            "it, then retire the old secret."
+        ),
+    )
 
     fieldsets = (
         FieldSet('name', 'description', 'tags', name=_('Webhook')),
         FieldSet(
-            'payload_url', 'http_method', 'http_content_type', 'additional_headers', 'body_template', 'secret',
+            'payload_url', 'http_method', 'http_content_type', 'additional_headers', 'body_template', 'secrets',
             'timeout', name=_('HTTP Request')
         ),
         FieldSet('ssl_verification', 'ca_file_path', name=_('SSL')),
@@ -593,6 +694,33 @@ class WebhookForm(OwnerMixin, NetBoxModelForm):
             'additional_headers': forms.Textarea(attrs={'class': 'font-monospace'}),
             'body_template': forms.Textarea(attrs={'class': 'font-monospace'}),
         }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Populate the signing-secret editor with the persisted rows (the field has no model
+        # attribute of its own to bind to).
+        if self.instance.pk:
+            self.fields['secrets'].initial = list(self.instance.secrets.order_by('key_id'))
+
+    def clean(self):
+        super().clean()
+
+        if 'secrets' in self.cleaned_data:
+            try:
+                validate_signing_secrets(self.instance, self.cleaned_data['secrets'])
+            except forms.ValidationError as e:
+                self.add_error('secrets', e.message_dict.get('secrets', e.messages))
+
+    def save(self, commit=True):
+        instance = super().save(commit=commit)
+
+        # Reconcile signing secrets within the enclosing transaction (ObjectEditView saves the
+        # form inside transaction.atomic()), so an invalid set never leaves partial key rows.
+        if commit and 'secrets' in self.cleaned_data:
+            instance.sync_secrets(self.cleaned_data['secrets'])
+
+        return instance
 
 
 class EventRuleForm(OwnerMixin, NetBoxModelForm):
