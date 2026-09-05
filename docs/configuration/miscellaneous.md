@@ -159,6 +159,30 @@ The maximum amount (in bytes) of uploaded data that will be held in memory befor
 
 ---
 
+## IDEMPOTENCY_KEY_ENABLED
+
+Default: `True`
+
+Enables [idempotency key support](../integrations/rest-api.md#idempotent-writes) for unsafe REST API requests (POST, PUT, PATCH, DELETE). When enabled, a request carrying an `Idempotency-Key` header records its outcome, and subsequent identical requests carrying the same key replay the stored response instead of performing the write again. Set to `False` to disable the feature entirely; requests then behave as if no header were sent.
+
+---
+
+## IDEMPOTENCY_KEY_RETENTION
+
+Default: `86400` (24 hours)
+
+The length of time, in seconds, that completed idempotency records are retained. Records older than this are deleted by the daily system housekeeping job. Set this to `0` or `None` to retain records indefinitely.
+
+---
+
+## IDEMPOTENCY_KEY_LOCK_TIMEOUT
+
+Default: `60` (one minute)
+
+The maximum time, in seconds, that a concurrent request carrying an `Idempotency-Key` already in use will wait for the in-flight request to complete. If the wait elapses, the request is rejected with an `HTTP 409` response and the client may retry shortly to receive the stored result.
+
+---
+
 ## JOB_RETENTION
 
 !!! tip "Dynamic Configuration Parameter"

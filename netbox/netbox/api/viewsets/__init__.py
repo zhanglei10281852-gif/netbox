@@ -11,6 +11,7 @@ from rest_framework.exceptions import MethodNotAllowed
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
+from netbox.api.idempotency import IdempotencyExchange
 from netbox.api.serializers.features import ChangeLogMessageSerializer
 from utilities.api import get_annotations_for_serializer, get_prefetches_for_serializer
 from utilities.exceptions import AbortRequest, PreconditionFailed
@@ -84,6 +85,44 @@ class BaseViewSet(GenericViewSet):
     Base class for all API ViewSets. This is responsible for the enforcement of object-based permissions.
     """
     brief = False
+
+    def dispatch(self, request, *args, **kwargs):
+        """
+        Mirror DRF's APIView.dispatch (initialize -> authentication/permissions -> handler ->
+        exception handling -> finalize), wrapping the unsafe-method handler with Idempotency-Key
+        handling. The idempotency exchange runs only when the request carries an Idempotency-Key
+        header and is fully authenticated; everything else follows the standard DRF path exactly.
+        """
+        self.args = args
+        self.kwargs = kwargs
+        request = self.initialize_request(request, *args, **kwargs)
+        self.request = request
+        self.headers = self.default_response_headers
+
+        try:
+            self.initial(request, *args, **kwargs)
+
+            # Get the appropriate handler method (same resolution as DRF's APIView.dispatch)
+            method_not_allowed = self.http_method_not_allowed
+            if request.method.lower() in self.http_method_names:
+                handler = getattr(self, request.method.lower(), method_not_allowed)
+            else:
+                handler = method_not_allowed
+
+            exchange = IdempotencyExchange.engage(
+                request,
+                method_not_allowed=handler is method_not_allowed,
+            )
+            if exchange is not None:
+                response = exchange.run(self, handler, args, kwargs)
+            else:
+                response = handler(request, *args, **kwargs)
+
+        except Exception as exc:
+            response = self.handle_exception(exc)
+
+        self.response = self.finalize_response(request, response, *args, **kwargs)
+        return self.response
 
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)

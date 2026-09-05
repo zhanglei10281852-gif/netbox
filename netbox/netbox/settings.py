@@ -159,6 +159,9 @@ HTTP_CLIENT_IP_HEADERS = getattr(configuration, 'HTTP_CLIENT_IP_HEADERS', (
     'REMOTE_ADDR',
 ))
 HTTP_PROXIES = getattr(configuration, 'HTTP_PROXIES', {})
+IDEMPOTENCY_KEY_ENABLED = getattr(configuration, 'IDEMPOTENCY_KEY_ENABLED', True)
+IDEMPOTENCY_KEY_RETENTION = getattr(configuration, 'IDEMPOTENCY_KEY_RETENTION', 86400)
+IDEMPOTENCY_KEY_LOCK_TIMEOUT = getattr(configuration, 'IDEMPOTENCY_KEY_LOCK_TIMEOUT', 60)
 INTERNAL_IPS = getattr(configuration, 'INTERNAL_IPS', ('127.0.0.1', '::1'))
 ISOLATED_DEPLOYMENT = getattr(configuration, 'ISOLATED_DEPLOYMENT', False)
 JINJA_ENVIRONMENT_PARAMS = getattr(configuration, 'JINJA_ENVIRONMENT_PARAMS', [])
@@ -845,7 +848,9 @@ SPECTACULAR_SETTINGS = {
     }],
     'SWAGGER_UI_DIST': 'SIDECAR',
     'SWAGGER_UI_FAVICON_HREF': 'SIDECAR',
-    'POSTPROCESSING_HOOKS': [],
+    'POSTPROCESSING_HOOKS': [
+        'netbox.api.idempotency.idempotency_key_postprocessing_hook',
+    ],
 }
 
 #

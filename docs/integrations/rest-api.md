@@ -801,6 +801,33 @@ Background processing applies only to bulk operations (a JSON list) on a model's
 
 Two behaviors differ from a synchronous request and may change in a future release: field selection via [`fields`/`omit`](#specifying-fields) (and brief mode) is not applied to the stored result, and the authorization captured when the request is accepted is not re-checked if the token is later disabled or expires before the job runs.
 
+## Idempotent Writes
+
+Network automation clients frequently need to retry a write request (POST, PUT, PATCH, or DELETE) after a proxy timeout or lost connection. Retrying blindly can duplicate the effect of the original request — for example, creating the same object twice, recording duplicate change log entries, or enqueuing the same background job more than once. Supply an `Idempotency-Key` request header to make such retries safe:
+
+```no-highlight
+curl -s -X POST \
+-H "Authorization: Bearer $TOKEN" \
+-H "Content-Type: application/json" \
+-H "Idempotency-Key: 7d139e0c-4f2b-4e90-9f8c-0a1b2c3d4e5f" \
+http://netbox/api/dcim/sites/ \
+--data '{"name": "Site A", "slug": "site-a"}'
+```
+
+The key identifies a single logical request within the scope of the authenticated user, the HTTP method, and the request path. The first request with a given key executes normally, and its final result — the HTTP status code, response body, and relevant headers (such as `Location` and `ETag`) — is stored alongside a semantic fingerprint of the request (its raw body and any query parameter that affects write semantics, such as `background`).
+
+Behavior on subsequent requests carrying the same key:
+
+- **Identical request (same body and write-significant parameters):** the stored response is replayed with the same status code and body, and the response includes an `Idempotency-Replayed: true` header. The write is not performed again: no additional database changes, change log entries, event rule triggers, or background jobs result. Response-shaping query parameters (`fields`, `omit`, `brief`, `format`) do not affect the fingerprint and may differ between attempts.
+- **Different request body or write-significant parameters:** the request is rejected with `HTTP 409 Conflict` and is not executed. Use a fresh key for a different operation.
+- **Concurrent requests:** only one request executes; concurrent requests carrying the same key wait for the first request to complete and then receive its stored result. If the wait exceeds the configured lock timeout, the request fails with `HTTP 409` and may be retried.
+- **Server failures:** if the first request fails with a server-side error (5xx), nothing is stored and the key may be reused to retry the operation. Client errors (4xx) are stored and replayed like any other completed response.
+
+The key must contain 1–255 printable characters. Requests without an `Idempotency-Key` header, as well as read-only requests (GET/HEAD/OPTIONS), behave exactly as before. Completed idempotency records are retained for the configured retention period (default 24 hours) and reclaimed by the daily system housekeeping job; see [`IDEMPOTENCY_KEY_RETENTION`](../configuration/miscellaneous.md#idempotency_key_retention).
+
+!!! note
+    The semantic fingerprint is based on the raw request body: a retry must send the same body byte-for-byte. Multipart/form-data requests that regenerate a random `boundary` between attempts will be treated as different requests and rejected with `409`; this does not affect JSON clients. A replay returns the original response as produced by the first request, including its content type and any `Location`/`ETag` headers, regardless of the retry request's `Accept` header.
+
 ## Changelog Messages
 
 Most objects in NetBox support [change logging](../features/change-logging.md), which generates a detailed record each time an object is created, modified, or deleted. Additionally, users can attach a message to the change record as well. This is accomplished via the REST API by including a `changelog_message` field in the object representation.
@@ -992,3 +1019,11 @@ A weak entity tag (e.g. `W/"2026-05-01T17:42:11.123456+00:00"`) returned on deta
 ### `If-Match`
 
 A request header which may be supplied on `PATCH` or `PUT` requests targeting a single object. If the object's current ETag does not match any value supplied, the request is rejected with a `412 Precondition Failed` response. A literal value of `*` matches any existing object. See [Concurrent Update Protection](#concurrent-update-protection) for details.
+
+### `Idempotency-Key`
+
+A request header which may be supplied on write requests (POST, PUT, PATCH, DELETE) to make retries safe. The first request with a given key (within the scope of the authenticated user, HTTP method, and request path) executes normally, and subsequent identical requests replay its stored response rather than performing the write again. See [Idempotent Writes](#idempotent-writes).
+
+### `Idempotency-Replayed`
+
+A response header with value `true` indicating that the response was replayed from a previously completed request with the same `Idempotency-Key`, rather than being executed. The absence of this header means the request was executed normally.

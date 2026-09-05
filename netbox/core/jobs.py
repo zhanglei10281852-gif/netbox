@@ -9,7 +9,7 @@ from django.db.models import Exists, OuterRef, Subquery
 from django.utils import timezone
 from packaging import version
 
-from core.models import Job, ObjectChange
+from core.models import IdempotencyKey, Job, ObjectChange
 from netbox.config import Config
 from netbox.jobs import JobRunner, system_job
 from netbox.search.backends import search_backend
@@ -78,6 +78,7 @@ class SystemHousekeepingJob(JobRunner):
         self.send_census_report()
         self.clear_expired_sessions()
         self.prune_changelog()
+        self.prune_idempotency_keys()
         self.delete_expired_jobs()
         self.check_for_new_releases()
 
@@ -172,6 +173,23 @@ class SystemHousekeepingJob(JobRunner):
 
         count = expired_qs.delete()[0]
         self.logger.info(f'Deleted {count} expired changelog records')
+
+    def prune_idempotency_keys(self):
+        """
+        Delete completed REST API idempotency records older than the configured retention
+        period (IDEMPOTENCY_KEY_RETENTION, in seconds; 0/None retains them indefinitely).
+        """
+        self.logger.info('Pruning expired idempotency keys...')
+        retention = settings.IDEMPOTENCY_KEY_RETENTION
+        if not retention:
+            self.logger.info('No retention period specified; skipping.')
+            return
+
+        cutoff = timezone.now() - timedelta(seconds=retention)
+        self.logger.debug(f'Idempotency key retention period: {retention} seconds ({cutoff:%Y-%m-%d %H:%M:%S})')
+
+        count = IdempotencyKey.objects.prune_expired(retention_seconds=retention)
+        self.logger.info(f'Deleted {count} expired idempotency key records')
 
     def delete_expired_jobs(self):
         """

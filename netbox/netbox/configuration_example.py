@@ -159,6 +159,20 @@ EXEMPT_VIEW_PERMISSIONS = [
 #     'https': 'http://10.10.1.10:1080',
 # }
 
+# Idempotency support for unsafe REST API requests (POST/PUT/PATCH/DELETE). When a request includes an
+# Idempotency-Key header, its result is recorded and subsequent requests with the same key (within the same
+# authenticated user, HTTP method, and path) replay the original response instead of performing the write again.
+# Set to False to disable the feature entirely.
+IDEMPOTENCY_KEY_ENABLED = True
+
+# The length of time (in seconds) for which completed idempotency records are retained before being pruned by
+# the daily system housekeeping job. Set to 0 or None to retain records indefinitely.
+IDEMPOTENCY_KEY_RETENTION = 86400
+
+# The maximum time (in seconds) a concurrent request carrying the same Idempotency-Key will wait for the
+# in-flight request to complete before being told (HTTP 409) to retry shortly.
+IDEMPOTENCY_KEY_LOCK_TIMEOUT = 60
+
 # Enable custom logging. Please see the Django documentation for detailed guidance on configuring custom logs:
 #   https://docs.djangoproject.com/en/stable/topics/logging/
 LOGGING = {}
